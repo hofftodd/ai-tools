@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Pick a GGUF model from ~/models, then update llama-server, opencode, and pi
+# configs to point at it, and restart the llama-server systemd unit.
+set -euo pipefail
+
+MODELS_ROOT="${LLAMA_MODELS_ROOT:-$HOME/models}"
+LLAMA_CONFIG="${LLAMA_SERVER_CONFIG:-$HOME/.config/llama-server/config.env}"
+OPENCODE_CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
+PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
+PROVIDER_NAME="llama-local"
+DEFAULT_CTX=131072
+DEFAULT_OUT=8192
+
+die() { echo "error: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have jq || die "jq is required (sudo apt install jq)"
+[[ -d "$MODELS_ROOT" ]] || die "models root not found: $MODELS_ROOT"
+[[ -f "$LLAMA_CONFIG" ]] || die "llama-server config not found: $LLAMA_CONFIG"
+
+mapfile -t MODELS < <(find "$MODELS_ROOT" -type f -name '*.gguf' ! -name 'mmproj-*.gguf' | sort)
+[[ ${#MODELS[@]} -gt 0 ]] || die "no .gguf files under $MODELS_ROOT"
+
+# Currently active model (if any) per config.env. Used to mark the row and
+# show the user where they are before they pick.
+CURRENT_MODEL=""
+if line="$(grep -E '^MODEL=' "$LLAMA_CONFIG" | tail -1)"; then
+  CURRENT_MODEL="${line#MODEL=}"
+  CURRENT_MODEL="${CURRENT_MODEL#\"}"; CURRENT_MODEL="${CURRENT_MODEL%\"}"
+fi
+
+if [[ -n "$CURRENT_MODEL" ]]; then
+  echo "Current: ${CURRENT_MODEL#$MODELS_ROOT/}"
+else
+  echo "Current: <none>"
+fi
+echo
+echo "Available models in $MODELS_ROOT:"
+echo
+for i in "${!MODELS[@]}"; do
+  rel="${MODELS[$i]#$MODELS_ROOT/}"
+  size="$(du -h --apparent-size "${MODELS[$i]}" | cut -f1)"
+  marker=" "
+  [[ "${MODELS[$i]}" == "$CURRENT_MODEL" ]] && marker="*"
+  printf " %s %2d) %-7s %s\n" "$marker" "$((i+1))" "$size" "$rel"
+done
+echo
+read -rp "Select model number (q/0/Enter to cancel): " choice
+case "${choice:-}" in
+  ""|q|Q|0) echo "cancelled."; exit 0 ;;
+esac
+[[ "$choice" =~ ^[0-9]+$ ]] || die "not a number: $choice"
+(( choice >= 1 && choice <= ${#MODELS[@]} )) || die "out of range"
+
+MODEL="${MODELS[$((choice-1))]}"
+
+if [[ "$MODEL" == "$CURRENT_MODEL" ]]; then
+  echo "already active — no changes."
+  exit 0
+fi
+MODEL_DIR="$(dirname "$MODEL")"
+
+# Find sibling mmproj (prefer F16, fall back to BF16, F32).
+MMPROJ=""
+for cand in mmproj-F16.gguf mmproj-BF16.gguf mmproj-F32.gguf; do
+  if [[ -f "$MODEL_DIR/$cand" ]]; then MMPROJ="$MODEL_DIR/$cand"; break; fi
+done
+
+# Alias = parent dir name relative to MODELS_ROOT (sanitized), or the file's
+# basename if the model lives directly in $MODELS_ROOT.
+rel="${MODEL#$MODELS_ROOT/}"
+top="${rel%%/*}"
+if [[ "$top" == "$rel" ]]; then
+  raw="$(basename "$MODEL" .gguf)"
+else
+  raw="$top"
+fi
+ALIAS="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+
+INPUT_KINDS='["text"]'
+[[ -n "$MMPROJ" ]] && INPUT_KINDS='["text","image"]'
+
+echo
+echo "Selected:"
+echo "  MODEL : $MODEL"
+echo "  MMPROJ: ${MMPROJ:-<none>}"
+echo "  ALIAS : $ALIAS"
+echo
+
+# ---- Update llama-server config.env ----
+update_kv() {
+  local file="$1" key="$2" value="$3" esc
+  esc="$(printf '%s' "$value" | sed 's/[\\&|]/\\&/g')"
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*$|${key}=${esc}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+update_extra_alias() {
+  local file="$1" alias="$2" line current new esc
+  line="$(grep -E '^EXTRA_ARGS=' "$file" || true)"
+  if [[ -z "$line" ]]; then
+    printf 'EXTRA_ARGS="--alias %s"\n' "$alias" >> "$file"
+    return
+  fi
+  current="${line#EXTRA_ARGS=}"
+  current="${current#\"}"; current="${current%\"}"
+  if [[ "$current" =~ --alias[[:space:]]+[^[:space:]]+ ]]; then
+    new="$(printf '%s' "$current" | sed -E "s/--alias[[:space:]]+[^[:space:]]+/--alias ${alias}/")"
+  else
+    new="${current:+$current }--alias $alias"
+  fi
+  esc="$(printf '%s' "$new" | sed 's/[\\&|]/\\&/g')"
+  sed -i "s|^EXTRA_ARGS=.*$|EXTRA_ARGS=\"${esc}\"|" "$file"
+}
+
+update_kv "$LLAMA_CONFIG" MODEL "$MODEL"
+update_kv "$LLAMA_CONFIG" MMPROJ "$MMPROJ"
+update_extra_alias "$LLAMA_CONFIG" "$ALIAS"
+echo "updated $LLAMA_CONFIG"
+
+# ---- Update opencode config ----
+if [[ -f "$OPENCODE_CONFIG" ]]; then
+  tmp="$(mktemp)"
+  jq --arg id "$ALIAS" \
+     --arg name "$ALIAS (local)" \
+     --arg provider "$PROVIDER_NAME" \
+     --argjson ctx "$DEFAULT_CTX" \
+     --argjson out "$DEFAULT_OUT" '
+    .provider[$provider].models = ({} | .[$id] = {name: $name, limit: {context: $ctx, output: $out}})
+    | .model = ($provider + "/" + $id)
+    | .small_model = ($provider + "/" + $id)
+  ' "$OPENCODE_CONFIG" > "$tmp" && mv "$tmp" "$OPENCODE_CONFIG"
+  echo "updated $OPENCODE_CONFIG"
+else
+  echo "skipped (missing): $OPENCODE_CONFIG"
+fi
+
+# ---- Update pi config ----
+# Family-specific thinking-format hint: pi needs the right `thinkingFormat`
+# value (or none) so reasoning blocks render correctly. Detect by alias.
+THINK_FMT=""
+case "$ALIAS" in
+  *qwen*)              THINK_FMT="qwen-chat-template" ;;
+  *deepseek*)          THINK_FMT="deepseek" ;;
+  *glm*|*zai*|*chatglm*) THINK_FMT="zai" ;;
+  # gemma, llama, mistral, phi, etc. → no special format
+esac
+
+if [[ -f "$PI_CONFIG" ]]; then
+  tmp="$(mktemp)"
+  jq --arg id "$ALIAS" \
+     --arg name "$ALIAS (local)" \
+     --arg provider "$PROVIDER_NAME" \
+     --arg tf "$THINK_FMT" \
+     --argjson ctx "$DEFAULT_CTX" \
+     --argjson out "$DEFAULT_OUT" \
+     --argjson input "$INPUT_KINDS" '
+    .providers[$provider].compat = (
+      {supportsDeveloperRole: false, supportsReasoningEffort: false}
+      + (if $tf == "" then {} else {thinkingFormat: $tf} end)
+    )
+    | .providers[$provider].models = [{
+        id: $id,
+        name: $name,
+        reasoning: true,
+        input: $input,
+        contextWindow: $ctx,
+        maxTokens: $out,
+        cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
+      }]
+  ' "$PI_CONFIG" > "$tmp" && mv "$tmp" "$PI_CONFIG"
+  echo "updated $PI_CONFIG (thinkingFormat: ${THINK_FMT:-<none>})"
+else
+  echo "skipped (missing): $PI_CONFIG"
+fi
+
+# ---- Restart llama-server ----
+echo
+echo "restarting llama-server..."
+systemctl --user restart llama-server.service
+# Wait for the server to come back up (may take a while loading the model).
+for _ in $(seq 1 60); do
+  if curl -sf -o /dev/null http://127.0.0.1:8080/health; then
+    echo "llama-server: up"
+    break
+  fi
+  sleep 2
+done
+systemctl --user is-active llama-server.service >/dev/null \
+  && echo "service: active" \
+  || echo "service: NOT active — check 'journalctl --user -u llama-server -n 50'"
