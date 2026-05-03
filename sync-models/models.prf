@@ -1,0 +1,39 @@
+# Unison profile for one-way push of ~/models to /mnt/nas/models.
+# Loaded automatically when invoked as `unison models`.
+
+# Roots — local first, NAS second.
+root = /home/thoffman/models
+root = /mnt/nas/models
+
+# One-way: local is always authoritative. This blocks deletions on the NAS
+# from ever propagating back to local, and resolves all differences in favor
+# of /home/thoffman/models. Use rsync-style semantics, not bidirectional.
+force = /home/thoffman/models
+
+# Don't try to set permissions on the NAS. TrueNAS datasets typically use
+# NFSv4 ACLs that reject POSIX chmod after Mapall-mapped writes, and we
+# don't care about exact perms on the backup target anyway.
+perms = 0
+
+# Run without prompts.
+batch = true
+auto = true
+
+# Preserve mtimes so future fastcheck comparisons are reliable.
+times = true
+
+# Speed: use mtime + size to skip unchanged files instead of hashing.
+fastcheck = true
+
+# Use an external cp for very large files (>1 MB). Faster on big GGUFs.
+copythreshold = 1024
+
+# Ignore noise.
+ignore = Name .DS_Store
+ignore = Name *.tmp
+ignore = Name *.partial
+ignore = Path .Trash-*
+
+# Log to a known place.
+log = true
+logfile = /home/thoffman/.unison/models.log

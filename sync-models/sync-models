@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Bidirectional sync of ~/models with /mnt/nas/models via unison.
+# Profile lives next to this script; symlinked into ~/.unison on first run.
+set -euo pipefail
+
+PROFILE_NAME="models"
+SRC_PROFILE="$(cd "$(dirname "$0")" && pwd)/${PROFILE_NAME}.prf"
+DST_PROFILE="$HOME/.unison/${PROFILE_NAME}.prf"
+LOCAL_ROOT="$HOME/models"
+NAS_ROOT="/mnt/nas/models"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+command -v unison >/dev/null || die "unison not installed (run install-unison.sh)"
+[[ -d "$LOCAL_ROOT" ]] || die "local root missing: $LOCAL_ROOT"
+mountpoint -q /mnt/nas || die "/mnt/nas is not mounted"
+[[ -d "$NAS_ROOT" ]] || mkdir -p "$NAS_ROOT"
+
+# Make sure unison can find the profile under ~/.unison/.
+mkdir -p "$HOME/.unison"
+if [[ ! -e "$DST_PROFILE" ]]; then
+  ln -s "$SRC_PROFILE" "$DST_PROFILE"
+fi
+
+# Pass through any extra flags (e.g. -dryrun, -testserver).
+exec unison "$PROFILE_NAME" "$@"
