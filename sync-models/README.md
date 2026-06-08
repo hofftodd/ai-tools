@@ -33,9 +33,13 @@ runs use mtime+size fastcheck and only diff the changed files.
 - Roots: `/home/thoffman/models` and `/mnt/nas/models` (edit `models.prf` if
   your paths differ).
 - `prefer = newer` — newer mtime wins on conflict.
+- `perms = 0` + `dontchmod = true` — don't compare permission bits and never
+  call `chmod` on the NAS. TrueNAS NFSv4-ACL datasets reject POSIX chmod, which
+  otherwise aborts the whole transfer with "Error in setting permissions".
+- `nodeletion = /mnt/nas/models` — the NAS is a safe backup; unison never
+  deletes files there. New/changed files still sync both ways, but a local
+  deletion won't remove the NAS copy.
 - `batch = true`, `auto = true` — non-interactive.
-- `copythreshold = 1024` — uses external `cp` for files > 1 MB; faster on big
-  GGUFs than unison's built-in copy.
 - Ignores `.DS_Store`, `*.tmp`, `*.partial`, and `.Trash-*`.
 
 ## Schedule
