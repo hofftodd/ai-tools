@@ -9,6 +9,7 @@ INSTANCES_DIR="${LLAMA_INSTANCES_DIR:-$HOME/.config/llama-server/instances}"
 OPENCODE_CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
 PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
 OMP_CONFIG="${OMP_CONFIG:-$HOME/.omp/agent/models.yml}"
+CCR_CONFIG="${CCR_CONFIG:-$HOME/.claude-code-router/config.json}"
 PROVIDER_PREFIX="llama-"
 DEFAULT_HOST="${LLAMA_HOST:-0.0.0.0}"
 DEFAULT_CTX="${LLAMA_CTX:-131072}"
@@ -26,7 +27,14 @@ have jq || die "jq is required (sudo apt install jq)"
 mkdir -p "$INSTANCES_DIR"
 
 # ---- Model discovery ----------------------------------------------------------
-mapfile -t MODELS < <(find "$MODELS_ROOT" -type f -name '*.gguf' ! -name 'mmproj-*.gguf' | sort)
+# Multi-shard GGUFs are named "<base>-00001-of-00005.gguf". llama.cpp loads the
+# whole set when given the first shard, so we list only the first shard (or any
+# non-sharded file) and hide the rest.
+mapfile -t MODELS < <(
+  find "$MODELS_ROOT" -type f -name '*.gguf' ! -name 'mmproj-*.gguf' \
+    | awk '!/-[0-9]+-of-[0-9]+\.gguf$/ || /-0*1-of-[0-9]+\.gguf$/' \
+    | sort
+)
 [[ ${#MODELS[@]} -gt 0 ]] || die "no .gguf files under $MODELS_ROOT"
 
 # Compute alias for a model file: parent dir name relative to MODELS_ROOT
@@ -41,6 +49,18 @@ alias_for() {
     raw="$top"
   fi
   printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
+}
+
+# Human-readable on-disk size of a model. For a multi-shard set (path is the
+# first shard) sum every shard; otherwise just the single file.
+model_size() {
+  local path="$1"
+  if [[ "$path" =~ -0*1-of-[0-9]+\.gguf$ ]]; then
+    du -ch --apparent-size "${path%-*-of-*.gguf}"-*-of-*.gguf 2>/dev/null \
+      | tail -1 | cut -f1
+  else
+    du -h --apparent-size "$path" | cut -f1
+  fi
 }
 
 # Find sibling mmproj-*.gguf for a model file.
@@ -70,23 +90,41 @@ read_model() {
   echo "$m"
 }
 
-# Allocate a port for an alias: reuse its existing config's port, otherwise
-# pick the lowest free port starting from PORT_BASE that no other instance
-# config is using.
+# Allocate a port for an alias: prefer its existing config's port, but only if
+# nothing else has claimed it; otherwise pick the lowest free port from
+# PORT_BASE up. "Claimed" means held by another instance config that is NOT part
+# of this run's selection, or already handed out to an earlier pick this run.
 allocate_port() {
   local alias="$1"
-  local existing; existing="$(read_port "$INSTANCES_DIR/${alias}.env")"
-  [[ -n "$existing" ]] && { echo "$existing"; return; }
-
   declare -A used=()
   local f other_alias p
+  # Ports held by instances that are NOT part of this run's selection. Picked
+  # aliases are (re)allocated below and tracked via planned_port, so we skip
+  # their on-disk ports here — otherwise two picks that legitimately want
+  # different ports could block each other (and stale duplicate ports from an
+  # earlier run would never get resolved).
   for f in "$INSTANCES_DIR"/*.env; do
     [[ -f "$f" ]] || continue
     other_alias="$(basename "$f" .env)"
     [[ "$other_alias" == "$alias" ]] && continue
+    [[ -n "${picked_set[$other_alias]:-}" ]] && continue
     p="$(read_port "$f")"
     [[ -n "$p" ]] && used[$p]=1
   done
+  # Ports already handed out to other aliases earlier in this same run.
+  # allocate_port runs in a command-substitution subshell that inherits the
+  # parent's planned_port array, and the parent fills planned_port[$a] before
+  # the next iteration calls us.
+  local oa
+  for oa in "${!planned_port[@]}"; do
+    [[ "$oa" == "$alias" ]] && continue
+    [[ -n "${planned_port[$oa]:-}" ]] && used[${planned_port[$oa]}]=1
+  done
+  # Reuse this alias's own port if it's still free; else lowest free port.
+  local existing; existing="$(read_port "$INSTANCES_DIR/${alias}.env")"
+  if [[ -n "$existing" && -z "${used[$existing]:-}" ]]; then
+    echo "$existing"; return
+  fi
   p="$PORT_BASE"
   while [[ -n "${used[$p]:-}" ]]; do p=$((p+1)); done
   echo "$p"
@@ -138,7 +176,7 @@ for m in "${MODELS[@]}"; do MODEL_ALIASES+=("$(alias_for "$m")"); done
 declare -a RUNNING_INDICES=()
 for i in "${!MODELS[@]}"; do
   rel="${MODELS[$i]#$MODELS_ROOT/}"
-  size="$(du -h --apparent-size "${MODELS[$i]}" | cut -f1)"
+  size="$(model_size "${MODELS[$i]}")"
   a="${MODEL_ALIASES[$i]}"
   marker=" "
   if [[ "${current_model_per_alias[$a]:-}" == "${MODELS[$i]}" ]]; then
@@ -457,6 +495,53 @@ if [[ -d "$(dirname "$OMP_CONFIG")" ]] && have yq; then
   echo "updated $OMP_CONFIG"
 fi
 
+# ---- Update claude-code-router (ccr) config ---------------------------------
+# ccr proxies Claude Code (Anthropic Messages API) to our OpenAI-compatible
+# llama-server instances. Its config uses a Providers *array* and a Router map
+# whose values are "provider,model" strings. We preserve any non-llama-*
+# providers and any extra top-level / Router keys the user has set.
+#
+# Pick a small/fast model for the "background" route if one is running.
+ccr_bg_alias="${picked_aliases[0]}"
+for a in "${picked_aliases[@]}"; do
+  case "$a" in *oss*|*nano*|*e2b*|*e4b*|*mini*|*small*) ccr_bg_alias="$a"; break ;; esac
+done
+ccr_default="${PROVIDER_PREFIX}${picked_aliases[0]},${picked_aliases[0]}"
+ccr_background="${PROVIDER_PREFIX}${ccr_bg_alias},${ccr_bg_alias}"
+
+# Providers array (used for both the local config and the LAN example below).
+ccr_providers='[]'
+for a in "${picked_aliases[@]}"; do
+  port="${planned_port[$a]}"
+  ccr_providers="$(jq --arg name "${PROVIDER_PREFIX}${a}" \
+                      --arg url "http://127.0.0.1:${port}/v1/chat/completions" \
+                      --arg id "$a" \
+                      '. + [{
+                          name: $name,
+                          api_base_url: $url,
+                          api_key: "no-key-required",
+                          models: [$id]
+                       }]' <<< "$ccr_providers")"
+done
+
+if have ccr; then
+  mkdir -p "$(dirname "$CCR_CONFIG")"
+  if [[ -f "$CCR_CONFIG" ]]; then
+    ccr_existing="$(cat "$CCR_CONFIG")"
+  else
+    ccr_existing='{}'
+  fi
+  tmp="$(mktemp)"
+  jq --argjson new "$ccr_providers" \
+     --arg def "$ccr_default" \
+     --arg bg "$ccr_background" \
+     '.Providers = (((.Providers // []) | map(select((.name // "") | startswith("llama-") | not))) + $new)
+      | .Router = ((.Router // {}) + {default: $def, background: $bg, think: $def, longContext: $def})
+      | .Router.longContextThreshold = (.Router.longContextThreshold // 60000)' \
+     <<< "$ccr_existing" > "$tmp" && mv "$tmp" "$CCR_CONFIG"
+  echo "updated $CCR_CONFIG  (restart with 'ccr restart' to pick up changes)"
+fi
+
 # ---- Emit remote-friendly example configs ----------------------------------
 # Build configs that point at this host's LAN IP (instead of 127.0.0.1) so the
 # user can copy them onto another machine that talks to this llama-server.
@@ -497,6 +582,18 @@ if have yq; then
   echo "$pi_example" | yq -P '.' > "$EXAMPLES_DIR/omp-models.yml"
 fi
 
+# ccr (claude-code-router) example — Providers point at the LAN IP.
+ccr_example="$(jq --arg ip "$LAN_IP" \
+                  --arg def "$ccr_default" \
+                  --arg bg "$ccr_background" \
+                  --argjson providers "$ccr_providers" \
+                  -n '
+  {
+    Providers: ($providers | map(.api_base_url |= sub("127\\.0\\.0\\.1"; $ip))),
+    Router: {default: $def, background: $bg, think: $def, longContext: $def, longContextThreshold: 60000}
+  }')"
+echo "$ccr_example" > "$EXAMPLES_DIR/ccr-config.json"
+
 echo
 echo "Done. Active instances:"
 for a in "${picked_aliases[@]}"; do
@@ -510,3 +607,11 @@ echo "  $EXAMPLES_DIR/opencode.json     -> ~/.config/opencode/opencode.json on t
 echo "  $EXAMPLES_DIR/pi-models.json    -> ~/.pi/agent/models.json"
 [[ -f "$EXAMPLES_DIR/omp-models.yml" ]] && \
   echo "  $EXAMPLES_DIR/omp-models.yml    -> ~/.omp/agent/models.yml"
+echo "  $EXAMPLES_DIR/ccr-config.json   -> ~/.claude-code-router/config.json"
+
+if have ccr; then
+  echo
+  echo "Claude Code via claude-code-router:"
+  echo "  default model -> $ccr_default"
+  echo "  run 'ccr restart' then 'ccr code', or switch in-session: /model $ccr_default"
+fi
