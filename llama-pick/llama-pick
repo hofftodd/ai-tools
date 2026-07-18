@@ -1,377 +1,220 @@
 #!/usr/bin/env bash
-# Pick one or more GGUF models from ~/models, run each as its own
-# llama-server@<alias>.service systemd user instance, and keep the opencode
-# and pi configs in sync. Ports stick per alias across runs.
+# llama-pick — generate a llama-swap config from the GGUFs under ~/models and
+# repoint every client (opencode, pi, oh-my-pi, Claude Code) at the single
+# llama-swap endpoint.
+#
+# llama-swap loads models on demand and unloads idle ones (TTL), so "picking" no
+# longer means "which servers to run" — every model is always available. What you
+# pick here is which models stay *resident* (pinned hot, never unloaded); by
+# default that's the models you name on the command line.
+#
+#   llama-pick                       # keep the current resident set (from config.yaml)
+#   llama-pick ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
+#
+# One llama-swap systemd user service fronts everything on 0.0.0.0:8080, exposing
+# both the OpenAI (/v1) and Anthropic (/v1/messages) APIs, so Claude Code talks to
+# it directly — no claude-code-router needed.
 set -euo pipefail
 
 MODELS_ROOT="${LLAMA_MODELS_ROOT:-$HOME/models}"
-INSTANCES_DIR="${LLAMA_INSTANCES_DIR:-$HOME/.config/llama-server/instances}"
+SWAP_CONFIG="${LLAMA_SWAP_CONFIG:-$HOME/.config/llama-swap/config.yaml}"
 OPENCODE_CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
 PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
 OMP_CONFIG="${OMP_CONFIG:-$HOME/.omp/agent/models.yml}"
-CCR_CONFIG="${CCR_CONFIG:-$HOME/.claude-code-router/config.json}"
+CLAUDE_LOCAL="${CLAUDE_LOCAL:-$HOME/.local/bin/claude-local}"
+EXAMPLES_DIR="${LLAMA_EXAMPLES_DIR:-$HOME/.config/llama-server/examples}"
 PROVIDER_PREFIX="llama-"
-DEFAULT_HOST="${LLAMA_HOST:-0.0.0.0}"
+
+LLAMA_SERVER="${LLAMA_SERVER_BIN:-$HOME/.local/bin/llama-server}"
+SWAP_PORT="${LLAMA_SWAP_PORT:-8080}"
+ENDPOINT="http://127.0.0.1:${SWAP_PORT}"
+START_PORT="${LLAMA_SWAP_START_PORT:-5800}"
 DEFAULT_CTX="${LLAMA_CTX:-131072}"
 DEFAULT_NGL="${LLAMA_NGL:-99}"
 DEFAULT_THREADS="${LLAMA_THREADS:-$(nproc)}"
-DEFAULT_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:---jinja --flash-attn auto --cache-type-k q8_0 --cache-type-v q8_0}"
-PORT_BASE="${LLAMA_PORT_BASE:-8080}"
+DEFAULT_TTL="${LLAMA_TTL:-900}"
 DEFAULT_OUT=8192
+COMMON_FLAGS="${LLAMA_COMMON_FLAGS:---flash-attn auto --jinja --cache-type-k q8_0 --cache-type-v q8_0}"
 
 die()  { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 have jq || die "jq is required (sudo apt install jq)"
 [[ -d "$MODELS_ROOT" ]] || die "models root not found: $MODELS_ROOT"
-mkdir -p "$INSTANCES_DIR"
+[[ -x "$LLAMA_SERVER" ]] || die "llama-server not found at $LLAMA_SERVER"
+have llama-swap || die "llama-swap not on PATH (install to ~/.local/bin/llama-swap)"
 
 # ---- Model discovery ----------------------------------------------------------
-# Multi-shard GGUFs are named "<base>-00001-of-00005.gguf". llama.cpp loads the
-# whole set when given the first shard, so we list only the first shard (or any
-# non-sharded file) and hide the rest.
+# Multi-shard GGUFs are named "<base>-00001-of-00005.gguf"; llama.cpp loads the
+# whole set from the first shard, so list only the first shard. Exclude any
+# projector file (*mmproj*.gguf) — those are companions to a model, not models.
 mapfile -t MODELS < <(
-  find "$MODELS_ROOT" -type f -name '*.gguf' ! -name 'mmproj-*.gguf' \
+  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' \
     | awk '!/-[0-9]+-of-[0-9]+\.gguf$/ || /-0*1-of-[0-9]+\.gguf$/' \
     | sort
 )
 [[ ${#MODELS[@]} -gt 0 ]] || die "no .gguf files under $MODELS_ROOT"
 
-# Compute alias for a model file: parent dir name relative to MODELS_ROOT
-# (sanitized), or basename (no .gguf) if the file lives directly in the root.
+# Alias for a model file: parent dir name relative to MODELS_ROOT (sanitized), or
+# basename (no .gguf) if the file lives directly in the root.
 alias_for() {
   local path="$1" rel top raw
   rel="${path#$MODELS_ROOT/}"
   top="${rel%%/*}"
-  if [[ "$top" == "$rel" ]]; then
-    raw="$(basename "$path" .gguf)"
-  else
-    raw="$top"
-  fi
+  if [[ "$top" == "$rel" ]]; then raw="$(basename "$path" .gguf)"; else raw="$top"; fi
   printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
 }
 
-# Human-readable on-disk size of a model. For a multi-shard set (path is the
-# first shard) sum every shard; otherwise just the single file.
+# Human-readable on-disk size (sums shards for a multi-shard set).
 model_size() {
   local path="$1"
   if [[ "$path" =~ -0*1-of-[0-9]+\.gguf$ ]]; then
-    du -ch --apparent-size "${path%-*-of-*.gguf}"-*-of-*.gguf 2>/dev/null \
-      | tail -1 | cut -f1
+    du -ch --apparent-size "${path%-*-of-*.gguf}"-*-of-*.gguf 2>/dev/null | tail -1 | cut -f1
   else
     du -h --apparent-size "$path" | cut -f1
   fi
 }
 
-# Find sibling mmproj-*.gguf for a model file.
+# Sibling projector for a vision model, or "".
 mmproj_for() {
-  local dir; dir="$(dirname "$1")"
-  local cand
+  local dir cand
+  dir="$(dirname "$1")"
   for cand in mmproj-F16.gguf mmproj-BF16.gguf mmproj-F32.gguf; do
     [[ -f "$dir/$cand" ]] && { echo "$dir/$cand"; return; }
   done
-  echo ""
+  cand="$(find "$dir" -maxdepth 1 -iname '*mmproj*.gguf' | sort | head -1)"
+  echo "$cand"
 }
 
-# Read PORT= from an instance .env, or empty.
-read_port() {
-  local cfg="$1" p
-  [[ -f "$cfg" ]] || { echo ""; return; }
-  p="$(grep -E '^PORT=' "$cfg" | tail -1 | cut -d= -f2 | tr -d '"')"
-  [[ "$p" =~ ^[0-9]+$ ]] && echo "$p" || echo ""
-}
-
-# Read MODEL= from an instance .env, or empty.
-read_model() {
-  local cfg="$1" m
-  [[ -f "$cfg" ]] || { echo ""; return; }
-  m="$(grep -E '^MODEL=' "$cfg" | tail -1 | cut -d= -f2-)"
-  m="${m#\"}"; m="${m%\"}"
-  echo "$m"
-}
-
-# Allocate a port for an alias: prefer its existing config's port, but only if
-# nothing else has claimed it; otherwise pick the lowest free port from
-# PORT_BASE up. "Claimed" means held by another instance config that is NOT part
-# of this run's selection, or already handed out to an earlier pick this run.
-allocate_port() {
-  local alias="$1"
-  declare -A used=()
-  local f other_alias p
-  # Ports held by instances that are NOT part of this run's selection. Picked
-  # aliases are (re)allocated below and tracked via planned_port, so we skip
-  # their on-disk ports here — otherwise two picks that legitimately want
-  # different ports could block each other (and stale duplicate ports from an
-  # earlier run would never get resolved).
-  for f in "$INSTANCES_DIR"/*.env; do
-    [[ -f "$f" ]] || continue
-    other_alias="$(basename "$f" .env)"
-    [[ "$other_alias" == "$alias" ]] && continue
-    [[ -n "${picked_set[$other_alias]:-}" ]] && continue
-    p="$(read_port "$f")"
-    [[ -n "$p" ]] && used[$p]=1
-  done
-  # Ports already handed out to other aliases earlier in this same run.
-  # allocate_port runs in a command-substitution subshell that inherits the
-  # parent's planned_port array, and the parent fills planned_port[$a] before
-  # the next iteration calls us.
-  local oa
-  for oa in "${!planned_port[@]}"; do
-    [[ "$oa" == "$alias" ]] && continue
-    [[ -n "${planned_port[$oa]:-}" ]] && used[${planned_port[$oa]}]=1
-  done
-  # Reuse this alias's own port if it's still free; else lowest free port.
-  local existing; existing="$(read_port "$INSTANCES_DIR/${alias}.env")"
-  if [[ -n "$existing" && -z "${used[$existing]:-}" ]]; then
-    echo "$existing"; return
-  fi
-  p="$PORT_BASE"
-  while [[ -n "${used[$p]:-}" ]]; do p=$((p+1)); done
-  echo "$p"
-}
-
-# Map alias -> running? via systemd.
-is_running() {
-  systemctl --user is-active --quiet "llama-server@$1.service"
-}
-
-# All alias names known from instance configs (whether running or not).
-existing_aliases() {
-  local f
-  for f in "$INSTANCES_DIR"/*.env; do
-    [[ -f "$f" ]] && basename "$f" .env
-  done | sort -u
-}
-
-# ---- Display state -----------------------------------------------------------
-echo "Currently running:"
-running_count=0
-for a in $(existing_aliases); do
-  if is_running "$a"; then
-    p="$(read_port "$INSTANCES_DIR/${a}.env")"
-    m="$(read_model "$INSTANCES_DIR/${a}.env")"
-    rel="${m#$MODELS_ROOT/}"
-    printf "  [%s] %-25s %s\n" "$p" "$a" "$rel"
-    running_count=$((running_count+1))
-  fi
-done
-[[ $running_count -eq 0 ]] && echo "  <none>"
-
-# Models the user has currently selected (one model file per running alias).
-declare -A current_model_per_alias=()
-for a in $(existing_aliases); do
-  if is_running "$a"; then
-    current_model_per_alias[$a]="$(read_model "$INSTANCES_DIR/${a}.env")"
-  fi
-done
-
-echo
-echo "Available models in $MODELS_ROOT:"
-echo
-
-# Pre-compute aliases for display.
-declare -a MODEL_ALIASES=()
-for m in "${MODELS[@]}"; do MODEL_ALIASES+=("$(alias_for "$m")"); done
-
-declare -a RUNNING_INDICES=()
-for i in "${!MODELS[@]}"; do
-  rel="${MODELS[$i]#$MODELS_ROOT/}"
-  size="$(model_size "${MODELS[$i]}")"
-  a="${MODEL_ALIASES[$i]}"
-  marker=" "
-  if [[ "${current_model_per_alias[$a]:-}" == "${MODELS[$i]}" ]]; then
-    marker="*"
-    RUNNING_INDICES+=("$((i+1))")
-  fi
-  printf " %s %2d) %-7s %s\n" "$marker" "$((i+1))" "$size" "$rel"
-done
-echo
-
-# Warn about running instances whose configured model file is missing — the
-# systemd service may still be live but won't survive a restart.
-declare -a STALE_RUNNING=()
-for a in $(existing_aliases); do
-  if is_running "$a"; then
-    m="${current_model_per_alias[$a]:-}"
-    [[ -n "$m" && ! -f "$m" ]] && STALE_RUNNING+=("$a")
-  fi
-done
-if [[ ${#STALE_RUNNING[@]} -gt 0 ]]; then
-  echo "WARNING: configured model file is missing on disk for these running instances:"
-  for a in "${STALE_RUNNING[@]}"; do
-    printf "  %s -> %s\n" "$a" "${current_model_per_alias[$a]}"
-  done
-  echo "  These won't survive a restart. Re-download or stop them."
-  echo
-fi
-
-# ---- Prompt ------------------------------------------------------------------
-echo "Select model numbers (space- or comma-separated)."
-echo "  Leading '*' marks a model currently active for its family."
-echo "  Pick at most one model per family."
-echo "  '*' on its own means: keep all currently running. Combine with numbers"
-echo "      to add more (e.g. '* 5')."
-echo "  Enter — no change (keep current set)."
-echo "  q     — cancel."
-echo
-read -rp "Selection: " choice
-
-# Cancel.
-case "${choice:-}" in
-  q|Q) echo "cancelled."; exit 0 ;;
-esac
-# Empty input → no change.
-if [[ -z "${choice// /}" ]]; then
-  echo "no change."
-  exit 0
-fi
-# Expand '*' to the indices of currently running, file-present models.
-if [[ "$choice" == *"*"* ]]; then
-  expanded="${RUNNING_INDICES[*]}"
-  choice="${choice//\*/$expanded}"
-fi
-
-# Normalize: split on space/comma, validate.
-IFS=', ' read -r -a TOKENS <<< "$choice"
-declare -A picked_alias_to_model=()
-declare -a picked_aliases=()  # preserves selection order for first-pick ports
-for t in "${TOKENS[@]}"; do
-  [[ -z "$t" ]] && continue
-  [[ "$t" =~ ^[0-9]+$ ]] || die "not a number: $t"
-  (( t >= 1 && t <= ${#MODELS[@]} )) || die "out of range: $t"
-  idx=$((t-1))
-  m="${MODELS[$idx]}"
-  a="${MODEL_ALIASES[$idx]}"
-  if [[ -n "${picked_alias_to_model[$a]:-}" ]]; then
-    [[ "${picked_alias_to_model[$a]}" == "$m" ]] || die "two models picked for family '$a': pick at most one per family"
-    continue
-  fi
-  picked_alias_to_model[$a]="$m"
-  picked_aliases+=("$a")
-done
-[[ ${#picked_aliases[@]} -gt 0 ]] || die "no valid selections"
-
-# Build the to-stop / to-start sets.
-declare -A picked_set=()
-for a in "${picked_aliases[@]}"; do picked_set[$a]=1; done
-
-declare -a TO_STOP=()
-for a in $(existing_aliases); do
-  if is_running "$a" && [[ -z "${picked_set[$a]:-}" ]]; then
-    TO_STOP+=("$a")
-  fi
-done
-
-# ---- Plan summary ------------------------------------------------------------
-declare -A planned_port=()
-echo
-echo "Plan:"
-for a in "${picked_aliases[@]}"; do
-  planned_port[$a]="$(allocate_port "$a")"
-  m="${picked_alias_to_model[$a]}"
-  rel="${m#$MODELS_ROOT/}"
-  printf "  start/restart  [%s] %-25s %s\n" "${planned_port[$a]}" "$a" "$rel"
-done
-for a in "${TO_STOP[@]}"; do
-  printf "  stop                 %s\n" "$a"
-done
-echo
-read -rp "Proceed? [Y/n] " ok
-case "${ok:-y}" in
-  y|Y|yes|YES) ;;
-  *) echo "cancelled."; exit 0 ;;
-esac
-
-# ---- Apply: write per-instance .env files -----------------------------------
-update_kv() {
-  local file="$1" key="$2" value="$3" esc
-  esc="$(printf '%s' "$value" | sed 's/[\\&|]/\\&/g')"
-  if grep -qE "^${key}=" "$file" 2>/dev/null; then
-    sed -i "s|^${key}=.*$|${key}=${esc}|" "$file"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$file"
-  fi
-}
-
-write_instance_env() {
-  local alias="$1" model="$2" port="$3"
-  local cfg="$INSTANCES_DIR/${alias}.env"
-  local mmproj; mmproj="$(mmproj_for "$model")"
-
-  if [[ ! -f "$cfg" ]]; then
-    {
-      echo "# llama-server instance — managed by llama-pick."
-      echo "ALIAS=$alias"
-      echo "MODEL=$model"
-      echo "MMPROJ=$mmproj"
-      echo "HOST=$DEFAULT_HOST"
-      echo "PORT=$port"
-      echo "CTX=$DEFAULT_CTX"
-      echo "NGL=$DEFAULT_NGL"
-      echo "THREADS=$DEFAULT_THREADS"
-      echo "EXTRA_ARGS=\"$DEFAULT_EXTRA_ARGS\""
-    } > "$cfg"
-  else
-    update_kv "$cfg" ALIAS "$alias"
-    update_kv "$cfg" MODEL "$model"
-    update_kv "$cfg" MMPROJ "$mmproj"
-    update_kv "$cfg" PORT "$port"
-  fi
-}
-
-for a in "${picked_aliases[@]}"; do
-  write_instance_env "$a" "${picked_alias_to_model[$a]}" "${planned_port[$a]}"
-done
-
-# ---- Apply: stop + start systemd services -----------------------------------
-for a in "${TO_STOP[@]}"; do
-  systemctl --user disable --now "llama-server@${a}.service" 2>&1 | sed 's/^/  /'
-done
-for a in "${picked_aliases[@]}"; do
-  systemctl --user enable "llama-server@${a}.service" 2>&1 | sed 's/^/  /' || true
-  systemctl --user restart "llama-server@${a}.service"
-done
-
-# ---- Wait for health ---------------------------------------------------------
-echo
-echo "Waiting for instances to come up..."
-for a in "${picked_aliases[@]}"; do
-  port="${planned_port[$a]}"
-  ready=0
-  for _ in $(seq 1 60); do
-    if curl -sf -o /dev/null "http://127.0.0.1:${port}/health"; then
-      ready=1; break
-    fi
-    sleep 2
-  done
-  if [[ $ready -eq 1 ]]; then
-    echo "  ok    $a @ $port"
-  else
-    echo "  TIMEOUT  $a @ $port  (check 'journalctl --user -u llama-server@$a -n 50')"
-  fi
-done
-
-# ---- Update opencode config --------------------------------------------------
-# Family-specific compat hints.
+# Family-specific reasoning-parse template hint (pi/omp compat).
 think_fmt_for() {
   case "$1" in
-    *qwen*)              echo "qwen-chat-template" ;;
+    *qwen*|*ornith*)     echo "qwen-chat-template" ;;  # Ornith is Qwen3.5-based
     *deepseek*)          echo "deepseek" ;;
     *glm*|*zai*|*chatglm*) echo "zai" ;;
     *)                    echo "" ;;
   esac
 }
 
-# Build opencode-shape providers (always, used both for the local config and
-# the remote-friendly example file emitted at the end).
-default_model="${PROVIDER_PREFIX}${picked_aliases[0]}/${picked_aliases[0]}"
+# Per-model extra llama-server flags (speculative decode, etc.).
+extra_flags_for() {
+  case "$1" in
+    *ornith*) echo "--spec-type draft-mtp" ;;  # in-model MTP self-speculative
+    *)        echo "" ;;
+  esac
+}
+
+# Models that can't run on the stock llama.cpp build (need a fork) → unlisted:
+# present in config for reference but hidden from clients and /v1/models.
+needs_fork() {
+  case "$1" in
+    *bonsai*) return 0 ;;  # ternary Q2_0 kernels need the PrismML llama.cpp fork
+    *)        return 1 ;;
+  esac
+}
+
+# ---- Precompute alias/metadata per model -------------------------------------
+# Base alias is the family dir. When a family holds several quants they'd collide
+# on one key, so those get disambiguated by full filename (e.g.
+# gemma-4-26b-a4b-it-ud-q4_k_m). Single-file families keep the clean short alias.
+sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'; }
+declare -a ALIASES=() LISTED_ALIASES=()
+declare -A base_count=()
+declare -a BASE_ALIASES=()
+for m in "${MODELS[@]}"; do
+  b="$(alias_for "$m")"; BASE_ALIASES+=("$b"); base_count[$b]=$(( ${base_count[$b]:-0} + 1 ))
+done
+for i in "${!MODELS[@]}"; do
+  b="${BASE_ALIASES[$i]}"
+  if [[ ${base_count[$b]} -gt 1 ]]; then
+    ALIASES+=("$(sanitize "$(basename "${MODELS[$i]}" .gguf)")")
+  else
+    ALIASES+=("$b")
+  fi
+done
+
+# ---- Resolve the resident set ------------------------------------------------
+# Priority: CLI args > existing config.yaml resident group > empty.
+declare -a RESIDENT=()
+if [[ $# -gt 0 ]]; then
+  RESIDENT=("$@")
+elif [[ -f "$SWAP_CONFIG" ]] && have yq; then
+  mapfile -t RESIDENT < <(yq -r '.groups.resident.members[]? // empty' "$SWAP_CONFIG" 2>/dev/null)
+fi
+is_resident() { local a; for a in "${RESIDENT[@]:-}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
+
+# Validate resident aliases exist.
+for r in "${RESIDENT[@]:-}"; do
+  found=0; for a in "${ALIASES[@]}"; do [[ "$a" == "$r" ]] && found=1; done
+  [[ $found -eq 1 ]] || die "resident model not found among discovered models: $r"
+done
+
+echo "Discovered ${#MODELS[@]} models under $MODELS_ROOT"
+echo "Resident (pinned hot): ${RESIDENT[*]:-<none>}"
+echo
+
+# ---- Emit llama-swap config.yaml ---------------------------------------------
+mkdir -p "$(dirname "$SWAP_CONFIG")"
+server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEFAULT_NGL --threads $DEFAULT_THREADS $COMMON_FLAGS"
+
+{
+  echo "# Generated by llama-pick — do not edit by hand; re-run llama-pick."
+  echo "healthCheckTimeout: 300"
+  echo "startPort: $START_PORT"
+  echo "logLevel: info"
+  echo
+  echo "macros:"
+  echo "  server: \"$server_macro\""
+  echo
+  echo "models:"
+  for i in "${!MODELS[@]}"; do
+    m="${MODELS[$i]}"; a="${ALIASES[$i]}"
+    mmproj="$(mmproj_for "$m")"; extra="$(extra_flags_for "$a")"
+    cmd="\${server} --model $m --ctx-size $DEFAULT_CTX --alias $a"
+    [[ -n "$mmproj" ]] && cmd+=" --mmproj $mmproj"
+    [[ -n "$extra"  ]] && cmd+=" $extra"
+    ttl="$DEFAULT_TTL"; is_resident "$a" && ttl=0
+    echo "  $a:"
+    echo "    cmd: \"$cmd\""
+    echo "    ttl: $ttl"
+    if needs_fork "$a"; then
+      echo "    unlisted: true   # needs PrismML llama.cpp fork; hidden until built"
+    else
+      LISTED_ALIASES+=("$a")
+    fi
+  done
+  if [[ ${#RESIDENT[@]} -gt 0 ]]; then
+    echo
+    echo "groups:"
+    echo "  resident:"
+    echo "    swap: false"
+    echo "    exclusive: false"
+    echo "    persistent: true"
+    echo "    members:"
+    for r in "${RESIDENT[@]}"; do echo "      - $r"; done
+    echo
+    echo "hooks:"
+    echo "  on_startup:"
+    echo "    preload:"
+    for r in "${RESIDENT[@]}"; do echo "      - $r"; done
+  fi
+} > "$SWAP_CONFIG"
+echo "wrote $SWAP_CONFIG"
+
+# Choose default + small models for clients (prefer resident; small = oss/nano/mini).
+default_alias="${RESIDENT[0]:-${LISTED_ALIASES[0]:-${ALIASES[0]}}}"
+small_alias="$default_alias"
+for a in "${RESIDENT[@]:-}" "${LISTED_ALIASES[@]}"; do
+  case "$a" in *oss*|*nano*|*mini*|*small*|*e2b*|*e4b*) small_alias="$a"; break ;; esac
+done
+
+# ---- Client provider builders (one provider per model, shared endpoint) ------
+# opencode providers.
 opencode_providers='{}'
-for a in "${picked_aliases[@]}"; do
-  port="${planned_port[$a]}"
-  name_pretty="${a} (local)"
+for a in "${LISTED_ALIASES[@]}"; do
   opencode_providers="$(jq --arg key "${PROVIDER_PREFIX}${a}" \
-                           --arg name "$name_pretty" \
-                           --arg url "http://127.0.0.1:${port}/v1" \
+                           --arg name "${a} (local)" \
+                           --arg url "${ENDPOINT}/v1" \
                            --arg id "$a" \
                            --argjson ctx "$DEFAULT_CTX" \
                            --argjson out "$DEFAULT_OUT" \
@@ -382,236 +225,122 @@ for a in "${picked_aliases[@]}"; do
                                models: ({} | .[$id] = {name: $name, limit: {context: $ctx, output: $out}})
                             }}' <<< "$opencode_providers")"
 done
+opencode_default="${PROVIDER_PREFIX}${default_alias}/${default_alias}"
+opencode_small="${PROVIDER_PREFIX}${small_alias}/${small_alias}"
 
 if [[ -f "$OPENCODE_CONFIG" ]]; then
+  cp -f "$OPENCODE_CONFIG" "$OPENCODE_CONFIG.bak"
   tmp="$(mktemp)"
   jq --argjson providers "$opencode_providers" \
-     --arg default_model "$default_model" \
+     --arg default_model "$opencode_default" \
+     --arg small_model "$opencode_small" \
      'with_entries(select(.key != "provider" and .key != "model" and .key != "small_model"))
-      + {provider: $providers, model: $default_model, small_model: $default_model}' \
+      + {provider: $providers, model: $default_model, small_model: $small_model}' \
      "$OPENCODE_CONFIG" > "$tmp" && mv "$tmp" "$OPENCODE_CONFIG"
-  echo "updated $OPENCODE_CONFIG"
+  echo "updated $OPENCODE_CONFIG (backup: $OPENCODE_CONFIG.bak)"
 fi
 
-# ---- Build pi-shape providers (always; used for pi config + omp + examples).
-pi_providers_json='{}'
-for a in "${picked_aliases[@]}"; do
-  port="${planned_port[$a]}"
-  tf="$(think_fmt_for "$a")"
-  mmproj="$(mmproj_for "${picked_alias_to_model[$a]}")"
-  input_kinds='["text"]'
-  [[ -n "$mmproj" ]] && input_kinds='["text","image"]'
-  pi_providers_json="$(jq --arg key "${PROVIDER_PREFIX}${a}" \
-                          --arg url "http://127.0.0.1:${port}/v1" \
-                          --arg id "$a" \
-                          --arg name "${a} (local)" \
-                          --arg tf "$tf" \
-                          --argjson ctx "$DEFAULT_CTX" \
-                          --argjson out "$DEFAULT_OUT" \
-                          --argjson input "$input_kinds" \
-                          '. + {($key): {
-                              baseUrl: $url,
-                              api: "openai-completions",
-                              apiKey: "no-key-required",
-                              compat: ({supportsDeveloperRole: false, supportsReasoningEffort: false}
-                                       + (if $tf == "" then {} else {thinkingFormat: $tf} end)),
-                              models: [{
-                                id: $id,
-                                name: $name,
-                                reasoning: true,
-                                input: $input,
-                                contextWindow: $ctx,
-                                maxTokens: $out,
-                                cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
-                              }]
-                           }}' <<< "$pi_providers_json")"
-done
+# pi/omp providers (same schema; carry per-family thinkingFormat).
+build_pi_providers() {
+  local out='{}' a tf mmproj input
+  for a in "${LISTED_ALIASES[@]}"; do
+    tf="$(think_fmt_for "$a")"
+    # locate this alias's model path to detect vision capability
+    local mpath="" j
+    for j in "${!ALIASES[@]}"; do [[ "${ALIASES[$j]}" == "$a" ]] && mpath="${MODELS[$j]}"; done
+    mmproj="$(mmproj_for "$mpath")"
+    input='["text"]'; [[ -n "$mmproj" ]] && input='["text","image"]'
+    out="$(jq --arg key "${PROVIDER_PREFIX}${a}" \
+              --arg url "${ENDPOINT}/v1" \
+              --arg id "$a" --arg name "${a} (local)" --arg tf "$tf" \
+              --argjson ctx "$DEFAULT_CTX" --argjson outt "$DEFAULT_OUT" --argjson input "$input" \
+              '. + {($key): {
+                  baseUrl: $url, api: "openai-completions", apiKey: "no-key-required",
+                  compat: ({supportsDeveloperRole: false, supportsReasoningEffort: false}
+                           + (if $tf == "" then {} else {thinkingFormat: $tf} end)),
+                  models: [{id: $id, name: $name, reasoning: true, input: $input,
+                            contextWindow: $ctx, maxTokens: $outt,
+                            cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}}]
+               }}' <<< "$out")"
+  done
+  echo "$out"
+}
+pi_providers_json="$(build_pi_providers)"
 
 if [[ -f "$PI_CONFIG" ]]; then
+  cp -f "$PI_CONFIG" "$PI_CONFIG.bak"
   tmp="$(mktemp)"
-  jq --argjson providers "$pi_providers_json" \
-     '.providers = $providers' \
+  jq --argjson providers "$pi_providers_json" '.providers = $providers' \
      "$PI_CONFIG" > "$tmp" && mv "$tmp" "$PI_CONFIG"
-  echo "updated $PI_CONFIG"
+  echo "updated $PI_CONFIG (backup: $PI_CONFIG.bak)"
 fi
 
-# ---- Update oh-my-pi (omp) config -------------------------------------------
-# omp uses ~/.omp/agent/models.yml. Same provider schema as pi, expressed in
-# YAML. We preserve any non-llama-* providers the user has configured.
 if [[ -d "$(dirname "$OMP_CONFIG")" ]] && have yq; then
-  # Build a JSON map of llama-* providers (same schema as pi).
-  omp_providers='{}'
-  for a in "${picked_aliases[@]}"; do
-    port="${planned_port[$a]}"
-    tf="$(think_fmt_for "$a")"
-    mmproj="$(mmproj_for "${picked_alias_to_model[$a]}")"
-    input_kinds='["text"]'
-    [[ -n "$mmproj" ]] && input_kinds='["text","image"]'
-    omp_providers="$(jq --arg key "${PROVIDER_PREFIX}${a}" \
-                        --arg url "http://127.0.0.1:${port}/v1" \
-                        --arg id "$a" \
-                        --arg name "${a} (local)" \
-                        --arg tf "$tf" \
-                        --argjson ctx "$DEFAULT_CTX" \
-                        --argjson out "$DEFAULT_OUT" \
-                        --argjson input "$input_kinds" \
-                        '. + {($key): {
-                            baseUrl: $url,
-                            api: "openai-completions",
-                            auth: "none",
-                            apiKey: "no-key-required",
-                            compat: ({supportsDeveloperRole: false, supportsReasoningEffort: false}
-                                     + (if $tf == "" then {} else {thinkingFormat: $tf} end)),
-                            models: [{
-                              id: $id,
-                              name: $name,
-                              reasoning: true,
-                              input: $input,
-                              contextWindow: $ctx,
-                              maxTokens: $out,
-                              cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}
-                            }]
-                         }}' <<< "$omp_providers")"
-  done
-
-  # Read existing config (or start empty), drop any llama-* entries, merge.
-  if [[ -f "$OMP_CONFIG" ]]; then
-    existing_json="$(yq -o=json '.' "$OMP_CONFIG")"
-  else
-    existing_json='{"providers": {}}'
-  fi
+  omp_providers="$(build_pi_providers | jq 'with_entries(.value += {auth: "none"})')"
+  if [[ -f "$OMP_CONFIG" ]]; then cp -f "$OMP_CONFIG" "$OMP_CONFIG.bak"; existing_json="$(yq -o=json '.' "$OMP_CONFIG")"; else existing_json='{"providers":{}}'; fi
   merged_json="$(jq --argjson new "$omp_providers" '
     .providers //= {}
-    | .providers = (
-        (.providers | to_entries
-          | map(select(.key | startswith("llama-") | not))
-          | from_entries)
-        + $new
-      )
+    | .providers = ((.providers | to_entries | map(select(.key | startswith("llama-") | not)) | from_entries) + $new)
   ' <<< "$existing_json")"
-
-  tmp="$(mktemp)"
-  echo "$merged_json" | yq -P '.' > "$tmp" && mv "$tmp" "$OMP_CONFIG"
+  tmp="$(mktemp)"; echo "$merged_json" | yq -P '.' > "$tmp" && mv "$tmp" "$OMP_CONFIG"
   echo "updated $OMP_CONFIG"
 fi
 
-# ---- Update claude-code-router (ccr) config ---------------------------------
-# ccr proxies Claude Code (Anthropic Messages API) to our OpenAI-compatible
-# llama-server instances. Its config uses a Providers *array* and a Router map
-# whose values are "provider,model" strings. We preserve any non-llama-*
-# providers and any extra top-level / Router keys the user has set.
-#
-# Pick a small/fast model for the "background" route if one is running.
-ccr_bg_alias="${picked_aliases[0]}"
-for a in "${picked_aliases[@]}"; do
-  case "$a" in *oss*|*nano*|*e2b*|*e4b*|*mini*|*small*) ccr_bg_alias="$a"; break ;; esac
+# ---- Claude Code wrapper (replaces `ccr code`) -------------------------------
+mkdir -p "$(dirname "$CLAUDE_LOCAL")"
+cat > "$CLAUDE_LOCAL" <<EOF
+#!/usr/bin/env bash
+# Generated by llama-pick. Run Claude Code against the local llama-swap endpoint
+# (Anthropic-native /v1/messages) — no claude-code-router needed.
+export ANTHROPIC_BASE_URL="${ENDPOINT}"
+export ANTHROPIC_API_KEY="no-key-required"
+export ANTHROPIC_MODEL="${default_alias}"
+export ANTHROPIC_SMALL_FAST_MODEL="${small_alias}"
+exec claude "\$@"
+EOF
+chmod +x "$CLAUDE_LOCAL"
+echo "wrote $CLAUDE_LOCAL (main=$default_alias small=$small_alias)"
+
+# ---- Restart llama-swap and health-check -------------------------------------
+systemctl --user enable llama-swap.service >/dev/null 2>&1 || true
+systemctl --user restart llama-swap.service
+echo
+echo "Waiting for llama-swap on :$SWAP_PORT ..."
+ready=0
+for _ in $(seq 1 30); do
+  if curl -sf -o /dev/null "${ENDPOINT}/v1/models"; then ready=1; break; fi
+  sleep 1
 done
-ccr_default="${PROVIDER_PREFIX}${picked_aliases[0]},${picked_aliases[0]}"
-ccr_background="${PROVIDER_PREFIX}${ccr_bg_alias},${ccr_bg_alias}"
+[[ $ready -eq 1 ]] && echo "  ok   llama-swap @ ${ENDPOINT}" \
+  || echo "  TIMEOUT (check 'journalctl --user -u llama-swap -n 50')"
 
-# Providers array (used for both the local config and the LAN example below).
-ccr_providers='[]'
-for a in "${picked_aliases[@]}"; do
-  port="${planned_port[$a]}"
-  ccr_providers="$(jq --arg name "${PROVIDER_PREFIX}${a}" \
-                      --arg url "http://127.0.0.1:${port}/v1/chat/completions" \
-                      --arg id "$a" \
-                      '. + [{
-                          name: $name,
-                          api_base_url: $url,
-                          api_key: "no-key-required",
-                          models: [$id]
-                       }]' <<< "$ccr_providers")"
-done
-
-if have ccr; then
-  mkdir -p "$(dirname "$CCR_CONFIG")"
-  if [[ -f "$CCR_CONFIG" ]]; then
-    ccr_existing="$(cat "$CCR_CONFIG")"
-  else
-    ccr_existing='{}'
-  fi
-  tmp="$(mktemp)"
-  jq --argjson new "$ccr_providers" \
-     --arg def "$ccr_default" \
-     --arg bg "$ccr_background" \
-     '.Providers = (((.Providers // []) | map(select((.name // "") | startswith("llama-") | not))) + $new)
-      | .Router = ((.Router // {}) + {default: $def, background: $bg, think: $def, longContext: $def})
-      | .Router.longContextThreshold = (.Router.longContextThreshold // 60000)' \
-     <<< "$ccr_existing" > "$tmp" && mv "$tmp" "$CCR_CONFIG"
-  echo "updated $CCR_CONFIG  (restart with 'ccr restart' to pick up changes)"
-fi
-
-# ---- Emit remote-friendly example configs ----------------------------------
-# Build configs that point at this host's LAN IP (instead of 127.0.0.1) so the
-# user can copy them onto another machine that talks to this llama-server.
-EXAMPLES_DIR="${LLAMA_EXAMPLES_DIR:-$HOME/.config/llama-server/examples}"
+# ---- Remote-friendly (LAN IP) example configs --------------------------------
 mkdir -p "$EXAMPLES_DIR"
-
 LAN_IP="$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)"
 [[ -z "$LAN_IP" ]] && LAN_IP="<host-ip>"
+LAN_ENDPOINT="http://${LAN_IP}:${SWAP_PORT}"
 
-# opencode example.
-opencode_example="$(jq --arg ip "$LAN_IP" \
-                       --arg default "$default_model" \
-                       --argjson providers "$opencode_providers" \
-                       -n '
-   {
-     "$schema": "https://opencode.ai/config.json",
-     provider: ($providers | with_entries(
-       .value.options.baseURL |= sub("127\\.0\\.0\\.1"; $ip)
-     )),
-     model: $default,
-     small_model: $default
-   }')"
-echo "$opencode_example" > "$EXAMPLES_DIR/opencode.json"
+jq --arg ip "$LAN_IP" --arg default "$opencode_default" --arg small "$opencode_small" \
+   --argjson providers "$opencode_providers" -n \
+   '{"$schema":"https://opencode.ai/config.json",
+     provider: ($providers | with_entries(.value.options.baseURL |= sub("127\\.0\\.0\\.1"; $ip))),
+     model: $default, small_model: $small}' > "$EXAMPLES_DIR/opencode.json"
 
-# pi example — same shape as ~/.pi/agent/models.json with the host swapped.
-pi_example="$(jq --arg ip "$LAN_IP" \
-                 --argjson providers "$pi_providers_json" \
-                 -n '
-  {
-    providers: ($providers | with_entries(
-      .value.baseUrl |= sub("127\\.0\\.0\\.1"; $ip)
-    ))
-  }')"
-echo "$pi_example" > "$EXAMPLES_DIR/pi-models.json"
+jq --arg ip "$LAN_IP" --argjson providers "$pi_providers_json" -n \
+   '{providers: ($providers | with_entries(.value.baseUrl |= sub("127\\.0\\.0\\.1"; $ip)))}' \
+   > "$EXAMPLES_DIR/pi-models.json"
+have yq && yq -P '.' "$EXAMPLES_DIR/pi-models.json" > "$EXAMPLES_DIR/omp-models.yml"
 
-# omp example (YAML). Reuse the pi shape.
-if have yq; then
-  echo "$pi_example" | yq -P '.' > "$EXAMPLES_DIR/omp-models.yml"
-fi
-
-# ccr (claude-code-router) example — Providers point at the LAN IP.
-ccr_example="$(jq --arg ip "$LAN_IP" \
-                  --arg def "$ccr_default" \
-                  --arg bg "$ccr_background" \
-                  --argjson providers "$ccr_providers" \
-                  -n '
-  {
-    Providers: ($providers | map(.api_base_url |= sub("127\\.0\\.0\\.1"; $ip))),
-    Router: {default: $def, background: $bg, think: $def, longContext: $def, longContextThreshold: 60000}
-  }')"
-echo "$ccr_example" > "$EXAMPLES_DIR/ccr-config.json"
+cat > "$EXAMPLES_DIR/claude-code.env" <<EOF
+# Claude Code against this host's llama-swap over the LAN.
+export ANTHROPIC_BASE_URL="${LAN_ENDPOINT}"
+export ANTHROPIC_API_KEY="no-key-required"
+export ANTHROPIC_MODEL="${default_alias}"
+export ANTHROPIC_SMALL_FAST_MODEL="${small_alias}"
+EOF
 
 echo
-echo "Done. Active instances:"
-for a in "${picked_aliases[@]}"; do
-  printf "  [%s] %s -> http://127.0.0.1:%s/v1   (LAN: http://%s:%s/v1)\n" \
-    "${planned_port[$a]}" "$a" "${planned_port[$a]}" "$LAN_IP" "${planned_port[$a]}"
-done
-
-echo
-echo "Remote-friendly client configs (LAN IP $LAN_IP) written to:"
-echo "  $EXAMPLES_DIR/opencode.json     -> ~/.config/opencode/opencode.json on the remote"
-echo "  $EXAMPLES_DIR/pi-models.json    -> ~/.pi/agent/models.json"
-[[ -f "$EXAMPLES_DIR/omp-models.yml" ]] && \
-  echo "  $EXAMPLES_DIR/omp-models.yml    -> ~/.omp/agent/models.yml"
-echo "  $EXAMPLES_DIR/ccr-config.json   -> ~/.claude-code-router/config.json"
-
-if have ccr; then
-  echo
-  echo "Claude Code via claude-code-router:"
-  echo "  default model -> $ccr_default"
-  echo "  run 'ccr restart' then 'ccr code', or switch in-session: /model $ccr_default"
-fi
+echo "Done. Single endpoint: ${ENDPOINT}  (LAN: ${LAN_ENDPOINT})"
+echo "  OpenAI:    ${ENDPOINT}/v1"
+echo "  Anthropic: ${ENDPOINT}/v1/messages   (use: claude-local)"
+echo "Remote-friendly examples written under $EXAMPLES_DIR/"

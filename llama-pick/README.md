@@ -1,165 +1,121 @@
 # llama-pick
 
-Interactive multi-instance switcher for the local `llama-server` setup. Lists
-every GGUF under `~/models/`, lets you pick one or more, runs each as its own
-`llama-server@<alias>.service` systemd user instance, and rewrites the client
-configs (opencode, pi, oh-my-pi) so they point at whatever is running.
+Generator that turns the GGUFs under `~/models/` into a [llama-swap](https://github.com/mostlygeek/llama-swap)
+config and repoints every client (opencode, pi, oh-my-pi, Claude Code) at the
+single llama-swap endpoint.
 
-Each model family gets a stable alias and a sticky port, so ports don't shuffle
-between runs and you can have several models serving at once.
+llama-swap is one proxy in front of `llama-server`: it reads the `model` field on
+each request, starts the right backend on demand, and unloads idle ones after a
+TTL. So you no longer choose *which servers to run* — every model is always
+addressable by name and RAM is reclaimed automatically. What you pick here is
+which models stay **resident** (pinned hot, never unloaded).
 
-## What it touches
+> **History:** llama-pick used to run one `llama-server@<alias>.service` systemd
+> instance per model with sticky ports. That approach forced manual RAM juggling
+> (only ~2 models fit at once) and needed `ccr` to translate for Claude Code.
+> It's now a config *generator* for llama-swap. See git history for the old flow;
+> the per-model `~/.config/llama-server/instances/*.env` files are left in place
+> as a rollback path.
 
-- `~/.config/llama-server/instances/<alias>.env` — one file per instance with
-  `ALIAS`, `MODEL`, `MMPROJ`, `HOST`, `PORT`, `CTX`, `NGL`, `THREADS`, and
-  `EXTRA_ARGS`. Consumed by the `llama-server@.service` systemd template unit.
-- `~/.config/opencode/opencode.json` — rebuilds the `provider` map (one
-  `llama-<alias>` entry per running instance) and sets the top-level `model` /
-  `small_model` to the first pick. Non-provider keys are preserved.
-- `~/.pi/agent/models.json` — replaces `.providers` with the `llama-<alias>`
-  set, including `compat.thinkingFormat` (by alias) and `input` (text, or
-  text+image when an mmproj is present).
-- `~/.omp/agent/models.yml` — same provider schema as pi, in YAML. Only updated
-  if its parent dir exists and `yq` is on `PATH`; any non-`llama-*` providers
-  you've configured are preserved.
-- `~/.claude-code-router/config.json` — lets [Claude Code](https://github.com/musistudio/claude-code-router)
-  talk to the local instances (ccr proxies Claude Code's Anthropic Messages API
-  to our OpenAI-compatible endpoints). Only updated if `ccr` is on `PATH`. Builds
-  a `Providers[]` entry per instance and points `Router.default`/`think`/
-  `longContext` at the first pick, with `background` routed to a small model
-  (`*oss*`/`*nano*`/`*mini*`/…) when one is running. Non-`llama-*` providers and
-  other top-level / `Router` keys are preserved.
-- `~/.config/llama-server/examples/` — remote-friendly copies of the opencode /
-  pi / omp configs with `127.0.0.1` swapped for this host's LAN IP, for copying
-  onto another machine that talks to this server.
+## Architecture
 
-After writing the instance env files it stops dropped instances
-(`systemctl --user disable --now`), starts/restarts the picked ones, and polls
-each `/health` endpoint (up to 60×2s) before updating the client configs.
-
-## Requirements
-
-- A `llama-server@.service` systemd user template unit that reads
-  `~/.config/llama-server/instances/<alias>.env`.
-- `jq` on `PATH` (`yq` too, if you want the omp config / example written).
-- GGUFs organized as `~/models/<family-dir>/<file>.gguf`. The directory name
-  (lowercased, non-`[a-z0-9._-]` → `-`) becomes the alias, e.g.
-  `~/models/qwen3.6-35b-a3b/…` → alias `qwen3.6-35b-a3b`. A GGUF sitting
-  directly in the models root uses its basename instead.
-- `mmproj-F16.gguf` (or `BF16` / `F32`) as a sibling of the model file enables
-  vision automatically — `MMPROJ=` is set and the client `input` becomes
-  `["text", "image"]`.
-- Multi-shard GGUFs (`<base>-00001-of-00005.gguf`, …) are handled: only the
-  first shard is listed (its size column sums the whole set), and `MODEL=` points
-  at that first shard — llama.cpp loads the remaining shards automatically.
-
-## Install
-
-The script lives in this directory and is symlinked from `~/.local/bin/`:
-
-```bash
-ln -s "$PWD/llama-pick" ~/.local/bin/llama-pick
 ```
+clients ──▶ llama-swap :8080 (0.0.0.0, LAN)  ──▶ llama-server backends :5800+ (127.0.0.1)
+  opencode / pi / omp  → /v1/chat/completions        started on demand, TTL-unloaded
+  Claude Code          → /v1/messages  (native)      resident group stays hot
+```
+
+Because `llama-server` (build ≥ ~10000) answers the Anthropic Messages API
+(`/v1/messages`) natively, **Claude Code talks to llama-swap directly — no
+claude-code-router.**
 
 ## Usage
 
 ```bash
-llama-pick
+llama-pick                          # regenerate, keeping the current resident set
+llama-pick ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
 ```
 
-Output looks like:
+On each run it: discovers models, writes `~/.config/llama-swap/config.yaml`,
+rewrites the client configs (backing up the old ones to `*.bak`), writes the
+`claude-local` wrapper, restarts the `llama-swap` systemd user service, and
+health-checks `http://127.0.0.1:8080/v1/models`.
 
-```
-Currently running:
-  [8080] gemma-4-26b-a4b           gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf
+The resident set defaults to CLI args; with no args it reads the existing
+`groups.resident.members` from `config.yaml` (needs `yq`), else empty.
 
-Available models in /home/thoffman/models:
+## What it writes
 
-   1) 16G    gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
- * 2) 20G    gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf
-   3) 21G    qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-   ...
+- **`~/.config/llama-swap/config.yaml`** — one `models:` entry per GGUF, a
+  shared `macros.server` command, `ttl: 0` for resident models (else 900s), a
+  non-exclusive persistent `groups.resident` that keeps the pinned models
+  co-loaded, and a `hooks.on_startup.preload` for them. Per-model extras: Ornith
+  gets `--spec-type draft-mtp` (MTP self-speculative decode); vision models get
+  `--mmproj`; models needing a forked llama.cpp (e.g. Bonsai ternary) are emitted
+  `unlisted: true` so they're hidden from clients until buildable.
+- **`~/.config/opencode/opencode.json`** — one `llama-<id>` provider per model,
+  all pointing at `http://127.0.0.1:8080/v1`; top-level `model` / `small_model`
+  set to the resident main / small pick. Non-provider keys preserved.
+- **`~/.pi/agent/models.json`** / **`~/.omp/agent/models.yml`** — same, with
+  per-family `compat.thinkingFormat` and `input` (text, or text+image with mmproj).
+- **`~/.local/bin/claude-local`** — wrapper that runs `claude` with
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, `ANTHROPIC_MODEL=<resident main>`,
+  `ANTHROPIC_SMALL_FAST_MODEL=<resident small>`. Replaces `ccr code`.
+- **`~/.config/llama-server/examples/`** — LAN-IP copies of the opencode / pi /
+  omp configs plus a `claude-code.env` for driving Claude Code from another host.
 
-Select model numbers (space- or comma-separated).
-  Leading '*' marks a model currently active for its family.
-  Pick at most one model per family.
-  '*' on its own means: keep all currently running. Combine with numbers
-      to add more (e.g. '* 5').
-  Enter — no change (keep current set).
-  q     — cancel.
+Multi-quant families are disambiguated by filename (e.g.
+`gemma-4-26b-a4b-it-ud-q4_k_m`); single-file families keep the short dir alias
+(`ornith-35b`). Projector files (`*mmproj*.gguf`) and non-first shards are never
+listed as models.
 
-Selection:
-```
+## Requirements
 
-`*` in the listing marks a currently-active model. In the prompt, `*` expands to
-all running instances — so `* 3` keeps everything running and adds model 3. You
-can only pick one model per family; picking nothing (Enter) leaves the set
-unchanged, `q` cancels.
+- `llama-swap` on `PATH` (release binary → `~/.local/bin/llama-swap`) and a
+  `~/.config/systemd/user/llama-swap.service` unit listening on `0.0.0.0:8080`.
+- `llama-server` at `~/.local/bin/llama-server` (build new enough for
+  `/v1/messages` and `--spec-type`).
+- `jq` on `PATH`; `yq` for the omp config and reading the resident set.
+- GGUFs organized as `~/models/<family-dir>/<file>.gguf`.
 
-After you confirm the plan, it stops/starts the relevant services, waits for
-health, rewrites the client configs, and prints the active instances with both
-their local (`127.0.0.1`) and LAN URLs.
-
-If a running instance's configured model file has gone missing on disk, a
-warning is printed — the service may still be live but won't survive a restart.
-
-## Claude Code (via claude-code-router)
-
-Claude Code speaks the Anthropic Messages API, not OpenAI, so it can't hit
-`llama-server` directly — [claude-code-router](https://github.com/musistudio/claude-code-router)
-(`ccr`) sits in between and translates. Once `ccr` is installed
-(`npm install -g @musistudio/claude-code-router`), `llama-pick` writes its config
-automatically on each run. Then:
+## Claude Code (no ccr)
 
 ```bash
-ccr restart      # pick up the regenerated config
-ccr code         # launch Claude Code routed at your local models
+claude-local        # launches Claude Code against your local models
 ```
 
-The first selected model becomes the `default` route, so Claude Code uses it
-with no further action. Switch models in-session with ccr's `/model` command:
+Main tasks route to the resident main model, small/fast tasks to the resident
+small model. Switch models in-session with Claude Code's `/model` command using
+any listed model ID.
 
-```
-/model llama-qwen3-coder-next,qwen3-coder-next
-```
+## Thinking-format detection (pi/omp)
 
-Note: tool-calling reliability and prompt caching are weaker than hosted Claude;
-coder-tuned models (e.g. Qwen3-Coder-Next) fare best in the agentic loop.
-
-## Thinking-format detection
-
-The script sets pi/omp `compat.thinkingFormat` based on the alias:
-
-| Alias contains | thinkingFormat   |
-| -------------- | ---------------- |
-| `qwen`         | `qwen-chat-template` |
-| `deepseek`     | `deepseek`       |
+| Alias contains | thinkingFormat |
+| --- | --- |
+| `qwen` / `ornith` | `qwen-chat-template` |
+| `deepseek` | `deepseek` |
 | `glm` / `zai` / `chatglm` | `zai` |
-| anything else  | omitted          |
-
-Other compat fields (`supportsDeveloperRole: false`,
-`supportsReasoningEffort: false`) are always set since llama.cpp's OpenAI shim
-supports neither.
+| anything else | omitted |
 
 ## Environment overrides
 
-| Variable              | Default                                          |
-| --------------------- | ------------------------------------------------ |
-| `LLAMA_MODELS_ROOT`   | `~/models`                                        |
-| `LLAMA_INSTANCES_DIR` | `~/.config/llama-server/instances`                |
-| `OPENCODE_CONFIG`     | `~/.config/opencode/opencode.json`                |
-| `PI_CONFIG`           | `~/.pi/agent/models.json`                         |
-| `OMP_CONFIG`          | `~/.omp/agent/models.yml`                         |
-| `CCR_CONFIG`          | `~/.claude-code-router/config.json`               |
-| `LLAMA_EXAMPLES_DIR`  | `~/.config/llama-server/examples`                 |
-| `LLAMA_HOST`          | `0.0.0.0`                                          |
-| `LLAMA_PORT_BASE`     | `8080` (first port; subsequent aliases climb up)  |
-| `LLAMA_CTX`           | `131072`                                          |
-| `LLAMA_NGL`           | `99`                                              |
-| `LLAMA_THREADS`       | `$(nproc)`                                        |
-| `LLAMA_EXTRA_ARGS`    | `--jinja --flash-attn auto --cache-type-k q8_0 --cache-type-v q8_0` |
+| Variable | Default |
+| --- | --- |
+| `LLAMA_MODELS_ROOT` | `~/models` |
+| `LLAMA_SWAP_CONFIG` | `~/.config/llama-swap/config.yaml` |
+| `LLAMA_SERVER_BIN` | `~/.local/bin/llama-server` |
+| `LLAMA_SWAP_PORT` | `8080` |
+| `LLAMA_SWAP_START_PORT` | `5800` |
+| `LLAMA_TTL` | `900` (non-resident idle unload, seconds) |
+| `LLAMA_CTX` | `131072` |
+| `LLAMA_NGL` | `99` |
+| `LLAMA_THREADS` | `$(nproc)` |
+| `LLAMA_COMMON_FLAGS` | `--flash-attn auto --jinja --cache-type-k q8_0 --cache-type-v q8_0` |
+| `OPENCODE_CONFIG` / `PI_CONFIG` / `OMP_CONFIG` | standard client paths |
+| `CLAUDE_LOCAL` | `~/.local/bin/claude-local` |
+| `LLAMA_EXAMPLES_DIR` | `~/.config/llama-server/examples` |
 
-These defaults are only written into an instance `.env` the first time it's
-created; editing an existing `.env` by hand is preserved (the script only
-rewrites `ALIAS`, `MODEL`, `MMPROJ`, and `PORT` on subsequent runs). The client
-max-output-tokens is a hardcoded constant (`DEFAULT_OUT=8192`).
+## Security
+
+llama-swap listens on `0.0.0.0:8080` with no auth. On an untrusted network, bind
+it to localhost/Tailscale or front it with an authenticating reverse proxy.
