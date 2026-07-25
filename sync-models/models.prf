@@ -37,6 +37,7 @@ fastcheck = true
 
 # Ignore noise.
 ignore = Name .DS_Store
+ignore = Name .cache
 ignore = Name *.tmp
 ignore = Name *.partial
 ignore = Path .Trash-*
