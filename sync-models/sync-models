@@ -22,5 +22,6 @@ if [[ ! -e "$DST_PROFILE" ]]; then
   ln -s "$SRC_PROFILE" "$DST_PROFILE"
 fi
 
-# Pass through any extra flags (e.g. -dryrun, -testserver).
+# Pass through any extra flags. Unison has no -dryrun; preview with
+# `-batch=false -auto=false`, which prompts before each action.
 exec unison "$PROFILE_NAME" "$@"
