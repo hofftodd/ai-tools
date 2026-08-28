@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# llama-pick — generate a llama-swap config from the GGUFs under ~/models and
+# llama-config — generate a llama-swap config from the GGUFs under ~/models and
 # repoint every client (opencode, pi, oh-my-pi, Claude Code) at the single
 # llama-swap endpoint.
 #
@@ -8,8 +8,8 @@
 # pick here is which models stay *resident* (pinned hot, never unloaded); by
 # default that's the models you name on the command line.
 #
-#   llama-pick                       # keep the current resident set (from config.yaml)
-#   llama-pick ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
+#   llama-config                       # keep the current resident set (from config.yaml)
+#   llama-config ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
 #
 # One llama-swap systemd user service fronts everything on 0.0.0.0:8080, exposing
 # both the OpenAI (/v1) and Anthropic (/v1/messages) APIs, so Claude Code talks to
@@ -23,6 +23,15 @@ PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
 OMP_CONFIG="${OMP_CONFIG:-$HOME/.omp/agent/models.yml}"
 CLAUDE_LOCAL="${CLAUDE_LOCAL:-$HOME/.local/bin/claude-local}"
 EXAMPLES_DIR="${LLAMA_EXAMPLES_DIR:-$HOME/.config/llama-server/examples}"
+OVERRIDES="${LLAMA_OVERRIDES:-$HOME/.config/llama-config/models.conf}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+GGUF_FIT="$SCRIPT_DIR/gguf-fit.py"
+FIT_ENABLED="${LLAMA_FIT:-1}"          # 0 disables VRAM fitting entirely
+FIT_MARGIN="${LLAMA_FIT_MARGIN:-2048}" # MiB held back per device
+FIT_COMPUTE="${LLAMA_FIT_COMPUTE:-512}"  # MiB estimate for compute buffers
+# This tool used to be called llama-pick. A models.conf under the old path is
+# hand-written policy, so migrate it rather than silently ignoring it.
+LEGACY_OVERRIDES="$HOME/.config/llama-pick/models.conf"
 PROVIDER_PREFIX="llama-"
 
 LLAMA_SERVER="${LLAMA_SERVER_BIN:-$HOME/.local/bin/llama-server}"
@@ -39,17 +48,129 @@ COMMON_FLAGS="${LLAMA_COMMON_FLAGS:---flash-attn auto --jinja --cache-type-k q8_
 die()  { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+if [[ ! -f "$OVERRIDES" && -f "$LEGACY_OVERRIDES" ]]; then
+  mkdir -p "$(dirname "$OVERRIDES")"
+  mv "$LEGACY_OVERRIDES" "$OVERRIDES"
+  rmdir "$(dirname "$LEGACY_OVERRIDES")" 2>/dev/null || true
+  echo "migrated $LEGACY_OVERRIDES -> $OVERRIDES"
+fi
+
 have jq || die "jq is required (sudo apt install jq)"
+have python3 || die "python3 is required (GGUF header parsing for VRAM fit)"
 [[ -d "$MODELS_ROOT" ]] || die "models root not found: $MODELS_ROOT"
 [[ -x "$LLAMA_SERVER" ]] || die "llama-server not found at $LLAMA_SERVER"
 have llama-swap || die "llama-swap not on PATH (install to ~/.local/bin/llama-swap)"
 
+# ---- Backend device discovery -------------------------------------------------
+# With both an iGPU and a discrete/external GPU present, llama.cpp currently
+# prefers the discrete one on its own — but that is a backend default, not a
+# promise, and it can change across rebuilds. Anything that cares (a model sized
+# to a specific card's VRAM) should be pinned explicitly via the overrides file.
+#
+# RADV enumerates integrated AMD GPUs under an APU codename; treat those as the
+# iGPU and the first non-matching device as the discrete/external one.
+IGPU_MATCH="${LLAMA_IGPU_MATCH:-PHOENIX|RENOIR|REMBRANDT|VANGOGH|RAPHAEL|GRANITE|CEZANNE|LUCIENNE|BARCELO|MENDOCINO|STRIX|KRACKAN}"
+declare -A DEV_NAME=() DEV_VRAM=()
+DEV_IGPU=""; DEV_DGPU=""
+while IFS= read -r line; do
+  [[ "$line" =~ ^[[:space:]]*([A-Za-z]+[0-9]+):[[:space:]]*(.*)$ ]] || continue
+  dev_id="${BASH_REMATCH[1]}"; dev_desc="${BASH_REMATCH[2]}"
+  DEV_NAME[$dev_id]="$dev_desc"
+  # "... (32624 MiB, 32566 MiB free)" -> total MiB
+  DEV_VRAM[$dev_id]="$(sed -n 's/.*(\([0-9]\+\) MiB,.*/\1/p' <<< "$dev_desc")"
+  if [[ "$dev_desc" =~ $IGPU_MATCH ]]; then
+    [[ -z "$DEV_IGPU" ]] && DEV_IGPU="$dev_id"
+  else
+    [[ -z "$DEV_DGPU" ]] && DEV_DGPU="$dev_id"
+  fi
+done < <("$LLAMA_SERVER" --list-devices 2>/dev/null | sed -n '/Available devices/,$p')
+
+# "egpu"/"igpu"/"auto" -> a concrete backend device id ("" means let llama.cpp choose).
+resolve_device() {
+  case "$1" in
+    auto|"")                echo "" ;;
+    egpu|dgpu|discrete)     [[ -n "$DEV_DGPU" ]] || die "no discrete GPU detected (wanted 'egpu')"; echo "$DEV_DGPU" ;;
+    igpu|integrated)        [[ -n "$DEV_IGPU" ]] || die "no integrated GPU detected (wanted 'igpu')"; echo "$DEV_IGPU" ;;
+    *)  # raw backend id, e.g. Vulkan1 -- must actually exist, or a typo would
+        # silently generate a llama-server command that fails at load time.
+        [[ -n "${DEV_NAME[$1]:-}" ]] || die "unknown device '$1' in $OVERRIDES (have: ${!DEV_NAME[*]})"
+        echo "$1" ;;
+  esac
+}
+
+# KV cache element width implied by the cache-type flags (q8_0 default).
+kv_elem_bytes() {
+  case "$COMMON_FLAGS" in
+    *"--cache-type-k f16"*)  echo 2 ;;
+    *"--cache-type-k q4_0"*) echo 0.5625 ;;
+    *)                       echo 1.0625 ;;   # q8_0
+  esac
+}
+
+# Largest context that keeps this model resident on $dev. Echoes "" when fitting
+# is off or the device VRAM is unknown, "0" when the weights alone do not fit.
+fit_ctx_for() {
+  local model="$1" dev="$2" mmproj="$3" mtp="$4" vram args=()
+  [[ "$FIT_ENABLED" == "1" ]] || return 0
+  vram="${DEV_VRAM[$dev]:-}"
+  [[ -n "$vram" ]] || return 0
+  [[ -n "$mmproj" ]] && args+=(--companion "$mmproj")
+  [[ -n "$mtp" ]] && args+=(--companion "$mtp")
+  python3 "$GGUF_FIT" "$model" --vram-mib "$vram" \
+    --margin-mib "$FIT_MARGIN" --compute-mib "$FIT_COMPUTE" \
+    --kv-bytes-per-elem "$(kv_elem_bytes)" "${args[@]}" 2>/dev/null || echo ""
+}
+
+# ---- Per-model overrides ------------------------------------------------------
+# Whitespace-separated: <alias> <device> <ctx> [extra llama-server flags...]
+# Use "-" to keep the default for device or ctx.
+# Seed a starter overrides file on first run so the knobs are discoverable.
+if [[ ! -f "$OVERRIDES" ]]; then
+  mkdir -p "$(dirname "$OVERRIDES")"
+  cat > "$OVERRIDES" <<'OVEOF'
+# llama-config per-model overrides.
+#
+#   <alias>   <device>   <ctx>   [extra llama-server flags...]
+#
+# device: egpu | igpu | auto | a raw backend id (Vulkan0/Vulkan1)
+# ctx:    context size, or - to accept the computed VRAM fit
+# Use - to keep the default for either field. Lines starting with # are ignored.
+#
+# Context is fitted to the target card automatically -- weights + KV cache +
+# compute buffers, held under VRAM with a margin (LLAMA_FIT_MARGIN, default
+# 2048 MiB). Set LLAMA_FIT=0 to turn fitting off. A ctx set here overrides the
+# computed value; the generated config records which applied per model.
+#
+# Pinning matters because llama-config passes --n-gpu-layers 99, which disables
+# llama.cpp's own auto-fit: over budget, it silently spills to host RAM over
+# PCIe rather than failing -- measured at roughly a 10x throughput loss.
+#
+# Examples -- uncomment and adapt:
+# qwen3-coder-30b-a3b-instruct-q4_k_m   egpu   -        --parallel 1
+# gpt-oss-20b                           igpu   -
+# qwen3.8-27b                           egpu   98304
+OVEOF
+  echo "seeded $OVERRIDES"
+fi
+
+declare -A OV_DEV=() OV_CTX=() OV_EXTRA=()
+if [[ -f "$OVERRIDES" ]]; then
+  while read -r ov_a ov_d ov_c ov_rest || [[ -n "${ov_a:-}" ]]; do
+    [[ -z "${ov_a:-}" || "$ov_a" == \#* ]] && continue
+    [[ -n "${ov_d:-}" && "$ov_d" != "-" ]] && OV_DEV[$ov_a]="$ov_d"
+    [[ -n "${ov_c:-}" && "$ov_c" != "-" ]] && OV_CTX[$ov_a]="$ov_c"
+    [[ -n "${ov_rest:-}" ]] && OV_EXTRA[$ov_a]="$ov_rest"
+  done < "$OVERRIDES"
+fi
+
 # ---- Model discovery ----------------------------------------------------------
 # Multi-shard GGUFs are named "<base>-00001-of-00005.gguf"; llama.cpp loads the
 # whole set from the first shard, so list only the first shard. Exclude any
-# projector file (*mmproj*.gguf) — those are companions to a model, not models.
+# projector file (*mmproj*.gguf) or MTP draft head (mtp-*.gguf) — those are
+# companions to a model, not models. A model whose own MTP weights are baked in
+# is suffixed instead ("...-Q6_K-MTP.gguf") and stays listed.
 mapfile -t MODELS < <(
-  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' \
+  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' ! -iname 'mtp-*.gguf' \
     | awk '!/-[0-9]+-of-[0-9]+\.gguf$/ || /-0*1-of-[0-9]+\.gguf$/' \
     | sort
 )
@@ -83,6 +204,15 @@ mmproj_for() {
     [[ -f "$dir/$cand" ]] && { echo "$dir/$cand"; return; }
   done
   cand="$(find "$dir" -maxdepth 1 -iname '*mmproj*.gguf' | sort | head -1)"
+  echo "$cand"
+}
+
+# Sibling MTP draft head for a model, or "". Unsloth ships it as mtp-<name>.gguf,
+# usually one level down in an MTP/ subdir.
+mtp_for() {
+  local dir cand
+  dir="$(dirname "$1")"
+  cand="$(find "$dir" -maxdepth 2 -iname 'mtp-*.gguf' | sort | head -1)"
   echo "$cand"
 }
 
@@ -120,6 +250,7 @@ needs_fork() {
 # gemma-4-26b-a4b-it-ud-q4_k_m). Single-file families keep the clean short alias.
 sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'; }
 declare -a ALIASES=() LISTED_ALIASES=()
+declare -A CTX_FOR=()
 declare -A base_count=()
 declare -a BASE_ALIASES=()
 for m in "${MODELS[@]}"; do
@@ -152,6 +283,12 @@ done
 
 echo "Discovered ${#MODELS[@]} models under $MODELS_ROOT"
 echo "Resident (pinned hot): ${RESIDENT[*]:-<none>}"
+for d in "${!DEV_NAME[@]}"; do
+  role=""
+  [[ "$d" == "$DEV_DGPU" ]] && role="  <- 'egpu'"
+  [[ "$d" == "$DEV_IGPU" ]] && role="  <- 'igpu'"
+  echo "Device $d: ${DEV_NAME[$d]}$role"
+done
 echo
 
 # ---- Emit llama-swap config.yaml ---------------------------------------------
@@ -159,7 +296,7 @@ mkdir -p "$(dirname "$SWAP_CONFIG")"
 server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEFAULT_NGL --threads $DEFAULT_THREADS $COMMON_FLAGS"
 
 {
-  echo "# Generated by llama-pick — do not edit by hand; re-run llama-pick."
+  echo "# Generated by llama-config — do not edit by hand; re-run llama-config."
   echo "healthCheckTimeout: 300"
   echo "startPort: $START_PORT"
   echo "logLevel: info"
@@ -171,11 +308,49 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
   for i in "${!MODELS[@]}"; do
     m="${MODELS[$i]}"; a="${ALIASES[$i]}"
     mmproj="$(mmproj_for "$m")"; extra="$(extra_flags_for "$(sanitize "$(basename "$m")")")"
-    cmd="\${server} --model $m --ctx-size $DEFAULT_CTX --alias $a"
+    mtp="$(mtp_for "$m")"
+    dev="$(resolve_device "${OV_DEV[$a]:-auto}")"
+    # Which card this model will actually land on: the pinned one, else the
+    # discrete GPU llama.cpp prefers on its own.
+    fit_dev="${dev:-$DEV_DGPU}"
+    fit_note=""
+    if [[ -n "${OV_CTX[$a]:-}" ]]; then
+      ctx="${OV_CTX[$a]}"; fit_note="ctx pinned in models.conf"
+    else
+      fitted="$(fit_ctx_for "$m" "$fit_dev" "$mmproj" "$mtp")"
+      if [[ -z "$fitted" ]]; then
+        ctx="$DEFAULT_CTX"; fit_note="fit unavailable; default ctx"
+      elif [[ "$fitted" == "0" ]]; then
+        ctx="$DEFAULT_CTX"
+        # Might still fit on the other card -- worth saying so rather than just
+        # reporting failure, even though that card is usually the slower one.
+        alt=""
+        for cand in "$DEV_DGPU" "$DEV_IGPU"; do
+          [[ -z "$cand" || "$cand" == "$fit_dev" ]] && continue
+          altfit="$(fit_ctx_for "$m" "$cand" "$mmproj" "$mtp")"
+          [[ -n "$altfit" && "$altfit" != "0" ]] && alt="$cand"
+        done
+        fit_note="DOES NOT FIT on $fit_dev (${DEV_VRAM[$fit_dev]:-?} MiB) - will spill to host RAM"
+        [[ -n "$alt" ]] && fit_note+="; fits on $alt (pin it in models.conf)"
+        echo "  warning: $a does not fit on $fit_dev; leaving ctx $DEFAULT_CTX${alt:+ (fits on $alt)}" >&2
+      else
+        ctx="$fitted"
+        fit_note="fitted to $fit_dev (${DEV_VRAM[$fit_dev]:-?} MiB, ${FIT_MARGIN} MiB margin)"
+      fi
+    fi
+    CTX_FOR[$a]="$ctx"
+    cmd="\${server} --model $m --ctx-size $ctx --alias $a"
+    [[ -n "$dev" ]] && cmd+=" --device $dev"
     [[ -n "$mmproj" ]] && cmd+=" --mmproj $mmproj"
-    [[ -n "$extra"  ]] && cmd+=" $extra"
+    if [[ -n "$mtp" ]]; then
+      cmd+=" --model-draft $mtp --spec-type draft-mtp"   # sidecar MTP head
+    elif [[ -n "$extra" ]]; then
+      cmd+=" $extra"
+    fi
+    [[ -n "${OV_EXTRA[$a]:-}" ]] && cmd+=" ${OV_EXTRA[$a]}"
     ttl="$DEFAULT_TTL"; is_resident "$a" && ttl=0
     echo "  $a:"
+    [[ -n "$fit_note" ]] && echo "    # $fit_note"
     echo "    cmd: \"$cmd\""
     echo "    ttl: $ttl"
     if needs_fork "$a"; then
@@ -217,7 +392,7 @@ for a in "${LISTED_ALIASES[@]}"; do
                            --arg name "${a} (local)" \
                            --arg url "${ENDPOINT}/v1" \
                            --arg id "$a" \
-                           --argjson ctx "$DEFAULT_CTX" \
+                           --argjson ctx "${CTX_FOR[$a]:-$DEFAULT_CTX}" \
                            --argjson out "$DEFAULT_OUT" \
                            '. + {($key): {
                                npm: "@ai-sdk/openai-compatible",
@@ -254,7 +429,7 @@ build_pi_providers() {
     out="$(jq --arg key "${PROVIDER_PREFIX}${a}" \
               --arg url "${ENDPOINT}/v1" \
               --arg id "$a" --arg name "${a} (local)" --arg tf "$tf" \
-              --argjson ctx "$DEFAULT_CTX" --argjson outt "$DEFAULT_OUT" --argjson input "$input" \
+              --argjson ctx "${CTX_FOR[$a]:-$DEFAULT_CTX}" --argjson outt "$DEFAULT_OUT" --argjson input "$input" \
               '. + {($key): {
                   baseUrl: $url, api: "openai-completions", apiKey: "no-key-required",
                   compat: ({supportsDeveloperRole: false, supportsReasoningEffort: false}
@@ -291,7 +466,7 @@ fi
 mkdir -p "$(dirname "$CLAUDE_LOCAL")"
 cat > "$CLAUDE_LOCAL" <<EOF
 #!/usr/bin/env bash
-# Generated by llama-pick. Run Claude Code against the local llama-swap endpoint
+# Generated by llama-config. Run Claude Code against the local llama-swap endpoint
 # (Anthropic-native /v1/messages) — no claude-code-router needed.
 export ANTHROPIC_BASE_URL="${ENDPOINT}"
 export ANTHROPIC_API_KEY="no-key-required"
