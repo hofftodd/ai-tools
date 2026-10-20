@@ -65,6 +65,11 @@ def kv_bytes_per_token(kv, bytes_per_elem, window_tokens):
         tokens no matter how large the context, so they cost ~nothing per token
       * hybrid SSM (Nemotron) -- layers with 0 KV heads are Mamba blocks whose
         state is constant per sequence, not per token
+      * hybrid linear attention (Qwen3.5+) -- full_attention_interval=N means
+        only every Nth layer keeps a KV cache; the rest are Gated DeltaNet
+        layers with a constant f32 recurrent state per sequence
+
+    Returns (per-token bytes, fixed bytes).
     """
     arch = kv.get('general.architecture', '')
 
@@ -91,12 +96,28 @@ def kv_bytes_per_token(kv, bytes_per_elem, window_tokens):
     swa_pattern = g('attention.sliding_window_pattern')
     swa_window = g('attention.sliding_window')
 
+    # Recurrent state of one linear-attention layer, in bytes (f32): the
+    # state_size x head_v_dim matrix per value head, plus the conv window.
+    # llama-server keeps one per slot and defaults to 4 slots.
+    full_every = g('full_attention_interval')
+    ssm_d, ssm_inner = g('ssm.state_size'), g('ssm.inner_size')
+    ssm_heads, ssm_groups = g('ssm.time_step_rank'), g('ssm.group_count', default=0)
+    rec_state = 0.0
+    if full_every and ssm_d and ssm_inner and ssm_heads:
+        rec_state = 4 * 4 * (ssm_d * ssm_inner
+                             + (g('ssm.conv_kernel', default=4) - 1)
+                             * (ssm_inner + 2 * ssm_groups * ssm_d))
+
     per_layer = hkv if isinstance(hkv, list) else [hkv] * n_layer
     per_token = 0.0       # elements per token of context
     fixed = 0.0           # elements independent of context (windowed layers)
+    fixed_bytes = 0.0     # recurrent state, already in bytes
     for i in range(min(n_layer, len(per_layer))):
         heads = per_layer[i]
         if not heads:                                        # SSM / non-attention layer
+            continue
+        if full_every and (i + 1) % full_every:              # linear-attention layer
+            fixed_bytes += rec_state
             continue
         windowed = bool(swa_pattern[i]) if (isinstance(swa_pattern, list)
                                             and i < len(swa_pattern)) else False
@@ -104,7 +125,7 @@ def kv_bytes_per_token(kv, bytes_per_elem, window_tokens):
             fixed += heads * (k_swa + v_swa) * min(swa_window, window_tokens)
         else:
             per_token += heads * (k_len + v_len)
-    return per_token * bytes_per_elem, fixed * bytes_per_elem
+    return per_token * bytes_per_elem, fixed * bytes_per_elem + fixed_bytes
 
 
 def main():

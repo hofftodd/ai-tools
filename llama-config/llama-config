@@ -10,6 +10,7 @@
 #
 #   llama-config                       # keep the current resident set (from config.yaml)
 #   llama-config ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
+#   llama-config none                  # pin nothing, so the eGPU can idle down
 #
 # One llama-swap systemd user service fronts everything on 0.0.0.0:8080, exposing
 # both the OpenAI (/v1) and Anthropic (/v1/messages) APIs, so Claude Code talks to
@@ -166,11 +167,11 @@ fi
 # ---- Model discovery ----------------------------------------------------------
 # Multi-shard GGUFs are named "<base>-00001-of-00005.gguf"; llama.cpp loads the
 # whole set from the first shard, so list only the first shard. Exclude any
-# projector file (*mmproj*.gguf) or MTP draft head (mtp-*.gguf) — those are
+# projector file (*mmproj*.gguf) or a draft head (mtp-*.gguf, dflash-*.gguf) — those are
 # companions to a model, not models. A model whose own MTP weights are baked in
 # is suffixed instead ("...-Q6_K-MTP.gguf") and stays listed.
 mapfile -t MODELS < <(
-  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' ! -iname 'mtp-*.gguf' \
+  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' ! -iname 'mtp-*.gguf' ! -iname 'dflash-*.gguf' \
     | awk '!/-[0-9]+-of-[0-9]+\.gguf$/ || /-0*1-of-[0-9]+\.gguf$/' \
     | sort
 )
@@ -212,8 +213,17 @@ mmproj_for() {
 mtp_for() {
   local dir cand
   dir="$(dirname "$1")"
-  cand="$(find "$dir" -maxdepth 2 -iname 'mtp-*.gguf' | sort | head -1)"
+  cand="$(find "$dir" -maxdepth 2 \( -iname 'mtp-*.gguf' -o -iname 'dflash-*.gguf' \) | sort | head -1)"
   echo "$cand"
+}
+
+# Correct --spec-type for a draft head found by mtp_for. Unsloth's MTP heads use
+# draft-mtp; Muse Glimmer's DFlash head needs draft-dflash.
+spec_type_for_draft() {
+  case "$(basename "$1" | tr '[:upper:]' '[:lower:]')" in
+    dflash-*) echo "draft-dflash" ;;
+    *)        echo "draft-mtp" ;;
+  esac
 }
 
 # Family-specific reasoning-parse template hint (pi/omp compat).
@@ -267,8 +277,13 @@ done
 
 # ---- Resolve the resident set ------------------------------------------------
 # Priority: CLI args > existing config.yaml resident group > empty.
+# "none" clears the set: without it there is no way to unpin, since a bare run
+# re-reads the group it wrote last time. Nothing pinned means the R9700 has no
+# process holding it open once TTLs expire, so it can runtime-suspend.
 declare -a RESIDENT=()
-if [[ $# -gt 0 ]]; then
+if [[ $# -eq 1 && ( "$1" == none || "$1" == - ) ]]; then
+  RESIDENT=()
+elif [[ $# -gt 0 ]]; then
   RESIDENT=("$@")
 elif [[ -f "$SWAP_CONFIG" ]] && have yq; then
   mapfile -t RESIDENT < <(yq -r '.groups.resident.members[]?' "$SWAP_CONFIG" 2>/dev/null)
@@ -309,7 +324,15 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
     m="${MODELS[$i]}"; a="${ALIASES[$i]}"
     mmproj="$(mmproj_for "$m")"; extra="$(extra_flags_for "$(sanitize "$(basename "$m")")")"
     mtp="$(mtp_for "$m")"
-    dev="$(resolve_device "${OV_DEV[$a]:-auto}")"
+    # Default to the discrete GPU. Left unpinned, llama.cpp splits a model
+    # across every Vulkan device by reported free memory, and the iGPU claims a
+    # share it can only back with GTT (host RAM over PCIe) -- measured at ~10x
+    # slower. An explicit models.conf entry still wins; 'auto' opts back out.
+    dev_pref="${OV_DEV[$a]:-}"
+    if [[ -z "$dev_pref" ]]; then
+      [[ -n "$DEV_DGPU" ]] && dev_pref="$DEV_DGPU" || dev_pref="auto"
+    fi
+    dev="$(resolve_device "$dev_pref")"
     # Which card this model will actually land on: the pinned one, else the
     # discrete GPU llama.cpp prefers on its own.
     fit_dev="${dev:-$DEV_DGPU}"
@@ -330,9 +353,18 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
           altfit="$(fit_ctx_for "$m" "$cand" "$mmproj" "$mtp")"
           [[ -n "$altfit" && "$altfit" != "0" ]] && alt="$cand"
         done
-        fit_note="DOES NOT FIT on $fit_dev (${DEV_VRAM[$fit_dev]:-?} MiB) - will spill to host RAM"
-        [[ -n "$alt" ]] && fit_note+="; fits on $alt (pin it in models.conf)"
-        echo "  warning: $a does not fit on $fit_dev; leaving ctx $DEFAULT_CTX${alt:+ (fits on $alt)}" >&2
+        if [[ -n "$alt" && -z "${OV_DEV[$a]:-}" ]]; then
+          # We chose this card by default, not the user -- so move the model to
+          # the card it actually fits on instead of pinning it into a spill.
+          dev="$alt"; fit_dev="$alt"
+          ctx="$(fit_ctx_for "$m" "$alt" "$mmproj" "$mtp")"
+          fit_note="does not fit on $DEV_DGPU; moved to $alt and fitted (${DEV_VRAM[$alt]:-?} MiB, ${FIT_MARGIN} MiB margin)"
+          echo "  note: $a does not fit on $DEV_DGPU; pinned to $alt at ctx $ctx" >&2
+        else
+          fit_note="DOES NOT FIT on $fit_dev (${DEV_VRAM[$fit_dev]:-?} MiB) - will spill to host RAM"
+          [[ -n "$alt" ]] && fit_note+="; fits on $alt (pin it in models.conf)"
+          echo "  warning: $a does not fit on $fit_dev; leaving ctx $DEFAULT_CTX${alt:+ (fits on $alt)}" >&2
+        fi
       else
         ctx="$fitted"
         fit_note="fitted to $fit_dev (${DEV_VRAM[$fit_dev]:-?} MiB, ${FIT_MARGIN} MiB margin)"
@@ -343,7 +375,7 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
     [[ -n "$dev" ]] && cmd+=" --device $dev"
     [[ -n "$mmproj" ]] && cmd+=" --mmproj $mmproj"
     if [[ -n "$mtp" ]]; then
-      cmd+=" --model-draft $mtp --spec-type draft-mtp"   # sidecar MTP head
+      cmd+=" --model-draft $mtp --spec-type $(spec_type_for_draft "$mtp")"  # sidecar draft head
     elif [[ -n "$extra" ]]; then
       cmd+=" $extra"
     fi

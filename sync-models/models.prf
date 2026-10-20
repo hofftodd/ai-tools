@@ -45,3 +45,21 @@ ignore = Path .Trash-*
 # Log to a known place.
 log = true
 logfile = /home/thoffman/.unison/models.log
+
+# Retired 2026-08-28 (see egpu benchmarks). Deleted locally but deliberately
+# KEPT on the NAS as cold backup, which `nodeletion` above guarantees. Without
+# these ignores unison re-reconciles the retired paths on every run, and if the
+# archive is ever reset it would see them as "new on the NAS" and pull all
+# ~284 GiB back down. Delete an ignore line to restore that model.
+ignore = Path qwen3-coder-next
+ignore = Path laguna-xs-2.1
+ignore = Path thinkingcap-qwen3.6-27b
+ignore = Path gemma-4-31b
+ignore = Path bonsai-27b
+ignore = Path nemotron-3-nano-30b-a3b
+ignore = Path qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf
+ignore = Path qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q6_K.gguf
+ignore = Path qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
+ignore = Path qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf
+ignore = Path gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+ignore = Path gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf
