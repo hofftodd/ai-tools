@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Runs hf-watch every 6 hours and at login. Install:
+       cp com.thoffman.hf-watch.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.thoffman.hf-watch.plist
+     Remove:
+       launchctl bootout gui/$(id -u)/com.thoffman.hf-watch && rm ~/Library/LaunchAgents/com.thoffman.hf-watch.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.thoffman.hf-watch</string>
+  <key>ProgramArguments</key><array><string>/Users/thoffman/dev/ai-tools/hf-watch/hf-watch</string></array>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StandardOutPath</key><string>/Users/thoffman/.cache/hf-watch/launchd.log</string>
+  <key>StandardErrorPath</key><string>/Users/thoffman/.cache/hf-watch/launchd.log</string>
+</dict>
+</plist>

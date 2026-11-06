@@ -8,6 +8,7 @@ side has a file the other doesn't — `prefer = newer` resolves them safely.
 
 - `sync-models` — wrapper script; symlinked to `~/.local/bin/sync-models`.
 - `models.prf` — unison profile; symlinked to `~/.unison/models.prf` on first run.
+- `models-mac.prf`, `sushi-mac.prf` — the Mac Studio's profiles (see below).
 
 ## Requirements
 
@@ -41,6 +42,22 @@ runs use mtime+size fastcheck and only diff the changed files.
   deletion won't remove the NAS copy.
 - `batch = true`, `auto = true` — non-interactive.
 - Ignores `.DS_Store`, `*.tmp`, `*.partial`, and `.Trash-*`.
+
+## Mac Studio (macOS)
+
+On macOS the script runs a **one-way backup** instead: `~/models` → `<nas>/models-mac`
+and `~/.sushi/models` → `<nas>/models-mac/sushi`. It writes to `models-mac/`, not
+`models/`, so the R9700's two-way sync doesn't pull the Mac's ~1 TB of models down.
+
+- Mount the share first (SMB; `mount_smbfs` asks for the password, so run it in a
+  regular terminal or save the password in the keychain via Finder ⌘K):
+  `mkdir -p ~/mnt/nas && mount_smbfs //thoffman@truenas.local/share ~/mnt/nas`.
+  The script checks the mount and that it's writable.
+- `force = <local root>` + `nodeletion = <nas root>`: the Mac's copy always wins,
+  nothing comes back from the NAS, and nothing on the NAS is deleted.
+- `rsrc = false`: unison can't read macOS resource forks back over SMB
+  ("Error in digesting …/..namedfork/rsrc"), which fails every large file.
+- The first run hashes everything (~1 TB) and copies at ~200–270 MiB/s.
 
 ## Schedule
 

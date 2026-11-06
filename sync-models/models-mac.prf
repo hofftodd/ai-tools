@@ -1,0 +1,32 @@
+# Mac Studio: one-way backup of ~/models to the NAS (models-mac/, separate from the R9700's
+# models/ so the R9700's two-way sync doesn't pull Mac-only models down to that box).
+# force = local root: the Mac's copy always wins; nodeletion keeps the NAS from losing files.
+# Together that means nothing ever flows from the NAS to the Mac, and nothing on the NAS is deleted.
+root = /Users/thoffman/models
+root = /Users/thoffman/mnt/nas/models-mac
+
+force = /Users/thoffman/models
+nodeletion = /Users/thoffman/mnt/nas/models-mac
+
+# SMB on TrueNAS: don't compare or set permission bits (see models.prf)
+perms = 0
+dontchmod = true
+# macOS resource forks can't be read back over SMB ("Error in digesting ..namedfork/rsrc"); models don't have any worth keeping
+rsrc = false
+
+batch = true
+auto = true
+times = true
+fastcheck = true
+
+ignore = Name .DS_Store
+ignore = Name .cache
+ignore = Name *.tmp
+ignore = Name *.partial
+ignore = Name *.incomplete
+ignore = Path .Trash-*
+# sushi packs go to models-mac/sushi through sushi-mac.prf
+ignore = Path sushi
+
+log = true
+logfile = /Users/thoffman/.unison/models-mac.log

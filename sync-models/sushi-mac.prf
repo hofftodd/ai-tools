@@ -1,0 +1,27 @@
+# Mac Studio: one-way backup of sushi's packs (~/.sushi/models) to the NAS, next to the GGUFs.
+# Same one-way rules as models-mac.prf.
+root = /Users/thoffman/.sushi/models
+root = /Users/thoffman/mnt/nas/models-mac/sushi
+
+force = /Users/thoffman/.sushi/models
+nodeletion = /Users/thoffman/mnt/nas/models-mac/sushi
+
+perms = 0
+dontchmod = true
+# macOS resource forks can't be read back over SMB ("Error in digesting ..namedfork/rsrc"); models don't have any worth keeping
+rsrc = false
+
+batch = true
+auto = true
+times = true
+fastcheck = true
+
+ignore = Name .DS_Store
+ignore = Name .cache
+ignore = Name *.tmp
+ignore = Name *.partial
+ignore = Name *.incomplete
+ignore = Path .Trash-*
+
+log = true
+logfile = /Users/thoffman/.unison/sushi-mac.log

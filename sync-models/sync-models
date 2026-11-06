@@ -1,26 +1,47 @@
 #!/usr/bin/env bash
-# Bidirectional sync of ~/models with /mnt/nas/models via unison.
-# Profile lives next to this script; symlinked into ~/.unison on first run.
+# Linux (R9700 box): bidirectional sync of ~/models with /mnt/nas/models via unison.
+# macOS (Mac Studio): one-way backup of ~/models and ~/.sushi/models to <nas>/models-mac.
+# Profiles live next to this script; symlinked into ~/.unison on first run.
 set -euo pipefail
 
-PROFILE_NAME="models"
-SRC_PROFILE="$(cd "$(dirname "$0")" && pwd)/${PROFILE_NAME}.prf"
-DST_PROFILE="$HOME/.unison/${PROFILE_NAME}.prf"
-LOCAL_ROOT="$HOME/models"
-NAS_ROOT="/mnt/nas/models"
+# realpath: the script is usually run through a symlink in ~/.local/bin
+HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+link_profile() {   # make sure unison can find the profile under ~/.unison/
+  mkdir -p "$HOME/.unison"
+  [[ -e "$HOME/.unison/$1.prf" ]] || ln -s "$HERE/$1.prf" "$HOME/.unison/$1.prf"
+}
+
 command -v unison >/dev/null || die "unison not installed (run install-unison.sh)"
+
+if [[ "$(uname)" == Darwin ]]; then
+  NAS_MOUNT="$HOME/mnt/nas"
+  # macOS has no `mountpoint`; check the mount table instead
+  mount | grep -q " on $NAS_MOUNT (" \
+    || die "$NAS_MOUNT is not mounted (mkdir -p $NAS_MOUNT && mount_smbfs //thoffman@truenas.local/share $NAS_MOUNT)"
+  { touch "$NAS_MOUNT/.sync-models-write-test" && rm -f "$NAS_MOUNT/.sync-models-write-test"; } 2>/dev/null \
+    || die "$NAS_MOUNT is read-only; remount it read-write"
+  mkdir -p "$NAS_MOUNT/models-mac/sushi"
+  status=0
+  for p in models-mac sushi-mac; do
+    link_profile "$p"
+    echo "== unison $p"
+    unison "$p" "$@" || status=$?   # unison exits 1 when some files were skipped; run the next profile anyway
+  done
+  exit "$status"
+fi
+
+PROFILE_NAME="models"
+LOCAL_ROOT="$HOME/models"
+NAS_ROOT="/mnt/nas/models"
+
 [[ -d "$LOCAL_ROOT" ]] || die "local root missing: $LOCAL_ROOT"
 mountpoint -q /mnt/nas || die "/mnt/nas is not mounted"
 [[ -d "$NAS_ROOT" ]] || mkdir -p "$NAS_ROOT"
 
-# Make sure unison can find the profile under ~/.unison/.
-mkdir -p "$HOME/.unison"
-if [[ ! -e "$DST_PROFILE" ]]; then
-  ln -s "$SRC_PROFILE" "$DST_PROFILE"
-fi
+link_profile "$PROFILE_NAME"
 
 # Pass through any extra flags. Unison has no -dryrun; preview with
 # `-batch=false -auto=false`, which prompts before each action.

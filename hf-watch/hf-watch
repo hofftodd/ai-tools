@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Check Hugging Face for new models matching the watch list; notify once per new repo.
+# Watch list: one "search term|author (optional)|id regex (optional)" per line in watchlist.txt next to this script.
+set -euo pipefail
+HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+STATE="$HOME/.cache/hf-watch"; mkdir -p "$STATE"
+SEEN="$STATE/seen.txt"; touch "$SEEN"
+LOG="$STATE/hf-watch.log"
+
+grep -vE '^\s*(#|$)' "$HERE/watchlist.txt" | while IFS='|' read -r term author pattern; do
+  url="https://huggingface.co/api/models?search=$(printf %s "$term" | sed 's/ /%20/g')&sort=createdAt&direction=-1&limit=50"
+  [[ -n "${author:-}" ]] && url="$url&author=$author"
+  curl -fsS -m 30 "$url" | python3 -I -c '
+import json, re, sys
+pat = re.compile(sys.argv[1] or ".", re.I)
+for m in json.load(sys.stdin):
+    if pat.search(m["id"]):
+        print(m["id"], m.get("createdAt", "")[:10])' "${pattern:-}" | while read -r id created; do
+    grep -qxF "$id" "$SEEN" && continue
+    echo "$id" >> "$SEEN"
+    msg="new on Hugging Face: $id ($created), matching \"$term\""
+    echo "$(date '+%F %T') $msg" | tee -a "$LOG"
+    [[ "${HF_WATCH_QUIET:-}" == 1 ]] || osascript -e "display notification \"$id ($created)\" with title \"hf-watch: $term\" sound name \"Glass\"" || true
+  done
+done

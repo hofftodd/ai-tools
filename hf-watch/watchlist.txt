@@ -1,0 +1,6 @@
+# search term|author (optional)|id regex (optional). Each new matching repo notifies once.
+# Inkling 2 Small: Thinking Machines' own weights, and the first GGUF/MLX conversions.
+# The regex keeps the original Inkling-Small's many conversions out.
+Inkling-2|thinkingmachines|inkling-?2
+Inkling 2 Small||inkling[-_ ]?2
+Inkling-2-Small||inkling[-_ ]?2
