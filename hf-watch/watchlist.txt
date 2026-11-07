@@ -4,3 +4,4 @@
 Inkling-2|thinkingmachines|inkling-?2
 Inkling 2 Small||inkling[-_ ]?2
 Inkling-2-Small||inkling[-_ ]?2
+Ripple-65B|ricursiveAI|ripple
