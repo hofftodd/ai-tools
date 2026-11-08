@@ -1,14 +1,22 @@
 # llama-config
 
-Generator that turns the GGUFs under `~/models/` into a [llama-swap](https://github.com/mostlygeek/llama-swap)
-config and repoints every client (opencode, pi, oh-my-pi, Claude Code) at the
-single llama-swap endpoint.
+Generator that turns the GGUFs under `~/models/` into a model-server config and
+repoints every client (opencode, pi, oh-my-pi, Claude Code) at the single
+endpoint on `:8080`.
+
+**Backend:** [ai-swap](https://github.com/hofftodd/ai-swap) when the
+`ai-swap.service` user unit is enabled (the current setup), otherwise
+[llama-swap](https://github.com/mostlygeek/llama-swap). Force one with
+`LLAMA_BACKEND=ai-swap` or `LLAMA_BACKEND=llama-swap`. Everything below about
+discovery, VRAM fitting, devices, draft heads, variants and clients applies to
+both; the differences are under [ai-swap backend](#ai-swap-backend).
 
 llama-swap is one proxy in front of `llama-server`: it reads the `model` field on
 each request, starts the right backend on demand, and unloads idle ones after a
 TTL. So you no longer choose *which servers to run* — every model is always
 addressable by name and RAM is reclaimed automatically. What you pick here is
-which models stay **resident** (pinned hot, never unloaded).
+which models are **resident** (preloaded and never TTL-unloaded; they step aside while another model
+runs — see `LLAMA_RESIDENT_EXCLUSIVE`).
 
 > **History:** llama-config used to run one `llama-server@<alias>.service` systemd
 > instance per model with sticky ports. That approach forced manual RAM juggling
@@ -44,12 +52,35 @@ health-checks `http://127.0.0.1:8080/v1/models`.
 The resident set defaults to CLI args; with no args it reads the existing
 `groups.resident.members` from `config.yaml` (needs `yq`), else empty.
 
+## ai-swap backend
+
+With ai-swap, llama-config writes `~/.config/ai-swap/config.yaml` instead of the
+llama-swap file:
+
+- The same models, `--device`, fitted `--ctx-size` and flags, as structured
+  `model` / `ctx` / `args` entries under one `engines.llamacpp` block.
+- `node.memory_budget_gb` is the discrete card's VRAM (31.8 GB on the R9700).
+  Each model reserves that card's VRAM minus the fit margin, so ai-swap runs one
+  at a time and swaps least-recently-used first. `LLAMA_AISWAP_BUDGET_GB`
+  overrides the budget.
+- The resident set becomes `node.resident`: preloaded, never idle-unloaded,
+  evicted when another model needs the card, and reloaded once it is free again.
+  With no CLI args it is read back from that file.
+- Any `peers:` already in the file are kept, so other machines (e.g. the Macs)
+  survive a regenerate.
+- The new file is checked with `ai-swap -check` first; if it fails, the old file
+  is left in place. The previous file is kept as `config.yaml.bak`.
+- Models that need a forked llama.cpp are left out (ai-swap has no `unlisted`).
+
+The script then stops and disables whichever of the two services is not the
+backend, so only one holds `:8080`, and restarts the backend.
+
 ## What it writes
 
 - **`~/.config/llama-swap/config.yaml`** — one `models:` entry per GGUF, a
   shared `macros.server` command, `ttl: 0` for resident models (else 900s), a
-  non-exclusive persistent `groups.resident` that keeps the pinned models
-  co-loaded, and a `hooks.on_startup.preload` for them. Per-model extras: models
+  `groups.resident` that is exclusive (loading it unloads other models, loading another model
+  unloads it, so nothing gets evicted into system RAM), and a `hooks.on_startup.preload` for them. Per-model extras: models
   with MTP weights get `--spec-type draft-mtp` (self-speculative decode) — baked
   into the GGUF for Ornith, or as a sibling `mtp-*.gguf` head passed with
   `--model-draft` for Qwen3.8; vision models get `--mmproj`; models needing a
@@ -93,6 +124,13 @@ qwen3.8-27b                          Vulkan1   98304
 - Anything after the third field is appended to that model's command verbatim.
 
 Use `-` to keep the default for either field — for `ctx` that means accepting the computed fit.
+
+An alias written `<new>=<base>` adds a second entry for the base model's GGUF. It inherits the
+base model's device, ctx and extra flags, then appends its own. For example, a fixed reasoning effort:
+
+```
+qwen3.8-27b-medium=qwen3.8-27b  -  -  --chat-template-kwargs '{"reasoning_effort":"medium"}'
+```
 
 Device roles are detected by matching RADV's APU codenames (`LLAMA_IGPU_MATCH`)
 against `llama-server --list-devices`; llama-config prints what it resolved on
@@ -193,6 +231,7 @@ any listed model ID.
 | `LLAMA_OVERRIDES` | `~/.config/llama-config/models.conf` |
 | `LLAMA_FIT` | `1` (`0` disables VRAM fitting) |
 | `LLAMA_FIT_MARGIN` | `2048` (MiB held back per device) |
+| `LLAMA_RESIDENT_EXCLUSIVE` | `1` (`0` = old behaviour: resident models stay co-loaded and are never unloaded, at the risk of amdgpu evicting them to system RAM) |
 | `LLAMA_FIT_COMPUTE` | `512` (MiB estimate for compute buffers) |
 | `LLAMA_IGPU_MATCH` | RADV APU codenames (`PHOENIX\|RENOIR\|...`) |
 

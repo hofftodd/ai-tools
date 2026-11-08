@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
-# llama-config — generate a llama-swap config from the GGUFs under ~/models and
-# repoint every client (opencode, pi, oh-my-pi, Claude Code) at the single
-# llama-swap endpoint.
+# llama-config — generate the model-server config from the GGUFs under ~/models
+# and repoint every client (opencode, pi, oh-my-pi, Claude Code) at the single
+# endpoint on :8080.
 #
-# llama-swap loads models on demand and unloads idle ones (TTL), so "picking" no
-# longer means "which servers to run" — every model is always available. What you
-# pick here is which models stay *resident* (pinned hot, never unloaded); by
-# default that's the models you name on the command line.
+# The server is ai-swap (github.com/hofftodd/ai-swap) when its systemd user
+# service is enabled, otherwise llama-swap; LLAMA_BACKEND=ai-swap|llama-swap
+# forces one. Either loads models on demand and unloads idle ones (TTL), so
+# "picking" no longer means "which servers to run" — every model is always
+# available. What you pick here is which models are *resident* (preloaded, no
+# idle TTL; under ai-swap they still give way when another model needs the GPU
+# and come back once it is free); by default that's the models you name on the
+# command line.
 #
 #   llama-config                       # keep the current resident set (from config.yaml)
 #   llama-config ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
 #   llama-config none                  # pin nothing, so the eGPU can idle down
 #
-# One llama-swap systemd user service fronts everything on 0.0.0.0:8080, exposing
-# both the OpenAI (/v1) and Anthropic (/v1/messages) APIs, so Claude Code talks to
-# it directly — no claude-code-router needed.
+# One systemd user service (ai-swap or llama-swap) fronts everything on
+# 0.0.0.0:8080, exposing both the OpenAI (/v1) and Anthropic (/v1/messages) APIs,
+# so Claude Code talks to it directly — no claude-code-router needed.
 set -euo pipefail
 
 MODELS_ROOT="${LLAMA_MODELS_ROOT:-$HOME/models}"
 SWAP_CONFIG="${LLAMA_SWAP_CONFIG:-$HOME/.config/llama-swap/config.yaml}"
+AISWAP_CONFIG="${AISWAP_CONFIG:-$HOME/.config/ai-swap/config.yaml}"
+# Which server to configure: ai-swap if its user service is enabled, else llama-swap.
+if [[ -z "${LLAMA_BACKEND:-}" ]]; then
+  if systemctl --user is-enabled ai-swap.service >/dev/null 2>&1; then LLAMA_BACKEND=ai-swap; else LLAMA_BACKEND=llama-swap; fi
+fi
+case "$LLAMA_BACKEND" in
+  ai-swap|llama-swap) ;;
+  *) echo "error: LLAMA_BACKEND must be ai-swap or llama-swap (got '$LLAMA_BACKEND')" >&2; exit 1 ;;
+esac
 OPENCODE_CONFIG="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
 PI_CONFIG="${PI_CONFIG:-$HOME/.pi/agent/models.json}"
 OMP_CONFIG="${OMP_CONFIG:-$HOME/.omp/agent/models.yml}"
@@ -60,7 +73,11 @@ have jq || die "jq is required (sudo apt install jq)"
 have python3 || die "python3 is required (GGUF header parsing for VRAM fit)"
 [[ -d "$MODELS_ROOT" ]] || die "models root not found: $MODELS_ROOT"
 [[ -x "$LLAMA_SERVER" ]] || die "llama-server not found at $LLAMA_SERVER"
-have llama-swap || die "llama-swap not on PATH (install to ~/.local/bin/llama-swap)"
+if [[ "$LLAMA_BACKEND" == ai-swap ]]; then
+  have ai-swap || die "ai-swap not on PATH (build github.com/hofftodd/ai-swap; link it to ~/.local/bin/ai-swap)"
+else
+  have llama-swap || die "llama-swap not on PATH (install to ~/.local/bin/llama-swap)"
+fi
 
 # ---- Backend device discovery -------------------------------------------------
 # With both an iGPU and a discrete/external GPU present, llama.cpp currently
@@ -154,10 +171,16 @@ OVEOF
   echo "seeded $OVERRIDES"
 fi
 
-declare -A OV_DEV=() OV_CTX=() OV_EXTRA=()
+declare -A OV_DEV=() OV_CTX=() OV_EXTRA=() VARIANT_OF=()
+declare -a VARIANTS=()
 if [[ -f "$OVERRIDES" ]]; then
   while read -r ov_a ov_d ov_c ov_rest || [[ -n "${ov_a:-}" ]]; do
     [[ -z "${ov_a:-}" || "$ov_a" == \#* ]] && continue
+    # "<new>=<base>" adds a second entry for base's GGUF under a new alias: it inherits base's
+    # device, ctx and flags, and appends its own (e.g. a lower reasoning effort).
+    if [[ "$ov_a" == *=* ]]; then
+      VARIANT_OF[${ov_a%%=*}]="${ov_a#*=}"; VARIANTS+=("${ov_a%%=*}"); ov_a="${ov_a%%=*}"
+    fi
     [[ -n "${ov_d:-}" && "$ov_d" != "-" ]] && OV_DEV[$ov_a]="$ov_d"
     [[ -n "${ov_c:-}" && "$ov_c" != "-" ]] && OV_CTX[$ov_a]="$ov_c"
     [[ -n "${ov_rest:-}" ]] && OV_EXTRA[$ov_a]="$ov_rest"
@@ -260,7 +283,7 @@ needs_fork() {
 # gemma-4-26b-a4b-it-ud-q4_k_m). Single-file families keep the clean short alias.
 sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'; }
 declare -a ALIASES=() LISTED_ALIASES=()
-declare -A CTX_FOR=()
+declare -A CTX_FOR=() FLAGS_FOR=() MODEL_FOR=() NOTE_FOR=() FITDEV_FOR=()
 declare -A base_count=()
 declare -a BASE_ALIASES=()
 for m in "${MODELS[@]}"; do
@@ -274,6 +297,15 @@ for i in "${!MODELS[@]}"; do
     ALIASES+=("$b")
   fi
 done
+for v in "${VARIANTS[@]}"; do
+  base="${VARIANT_OF[$v]}"; found=""
+  for i in "${!ALIASES[@]}"; do [[ "${ALIASES[$i]}" == "$base" ]] && found="$i"; done
+  [[ -n "$found" ]] || die "variant $v: base model not found among discovered models: $base"
+  MODELS+=("${MODELS[$found]}"); ALIASES+=("$v")
+  [[ -z "${OV_DEV[$v]:-}" && -n "${OV_DEV[$base]:-}" ]] && OV_DEV[$v]="${OV_DEV[$base]}"
+  [[ -z "${OV_CTX[$v]:-}" && -n "${OV_CTX[$base]:-}" ]] && OV_CTX[$v]="${OV_CTX[$base]}"
+  OV_EXTRA[$v]="${OV_EXTRA[$base]:-}${OV_EXTRA[$base]:+ }${OV_EXTRA[$v]:-}"
+done
 
 # ---- Resolve the resident set ------------------------------------------------
 # Priority: CLI args > existing config.yaml resident group > empty.
@@ -285,6 +317,8 @@ if [[ $# -eq 1 && ( "$1" == none || "$1" == - ) ]]; then
   RESIDENT=()
 elif [[ $# -gt 0 ]]; then
   RESIDENT=("$@")
+elif [[ "$LLAMA_BACKEND" == ai-swap && -f "$AISWAP_CONFIG" ]] && have yq; then
+  mapfile -t RESIDENT < <(yq -r '.node.resident[]?' "$AISWAP_CONFIG" 2>/dev/null)
 elif [[ -f "$SWAP_CONFIG" ]] && have yq; then
   mapfile -t RESIDENT < <(yq -r '.groups.resident.members[]?' "$SWAP_CONFIG" 2>/dev/null)
 fi
@@ -296,6 +330,7 @@ for r in "${RESIDENT[@]}"; do
   [[ $found -eq 1 ]] || die "resident model not found among discovered models: $r"
 done
 
+echo "Backend: $LLAMA_BACKEND"
 echo "Discovered ${#MODELS[@]} models under $MODELS_ROOT"
 echo "Resident (pinned hot): ${RESIDENT[*]:-<none>}"
 for d in "${!DEV_NAME[@]}"; do
@@ -307,7 +342,10 @@ done
 echo
 
 # ---- Emit llama-swap config.yaml ---------------------------------------------
-mkdir -p "$(dirname "$SWAP_CONFIG")"
+# The loop below also records each model's flags, which the ai-swap emitter
+# further down reuses; with the ai-swap backend the llama-swap YAML is discarded.
+swap_out="$SWAP_CONFIG"
+if [[ "$LLAMA_BACKEND" == llama-swap ]]; then mkdir -p "$(dirname "$SWAP_CONFIG")"; else swap_out=/dev/null; fi
 server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEFAULT_NGL --threads $DEFAULT_THREADS $COMMON_FLAGS"
 
 {
@@ -371,19 +409,21 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
       fi
     fi
     CTX_FOR[$a]="$ctx"
-    cmd="\${server} --model $m --ctx-size $ctx --alias $a"
-    [[ -n "$dev" ]] && cmd+=" --device $dev"
-    [[ -n "$mmproj" ]] && cmd+=" --mmproj $mmproj"
+    flags="--alias $a"
+    [[ -n "$dev" ]] && flags+=" --device $dev"
+    [[ -n "$mmproj" ]] && flags+=" --mmproj $mmproj"
     if [[ -n "$mtp" ]]; then
-      cmd+=" --model-draft $mtp --spec-type $(spec_type_for_draft "$mtp")"  # sidecar draft head
+      flags+=" --model-draft $mtp --spec-type $(spec_type_for_draft "$mtp")"  # sidecar draft head
     elif [[ -n "$extra" ]]; then
-      cmd+=" $extra"
+      flags+=" $extra"
     fi
-    [[ -n "${OV_EXTRA[$a]:-}" ]] && cmd+=" ${OV_EXTRA[$a]}"
+    [[ -n "${OV_EXTRA[$a]:-}" ]] && flags+=" ${OV_EXTRA[$a]}"
+    cmd="\${server} --model $m --ctx-size $ctx $flags"
+    FLAGS_FOR[$a]="$flags"; MODEL_FOR[$a]="$m"; NOTE_FOR[$a]="$fit_note"; FITDEV_FOR[$a]="$fit_dev"
     ttl="$DEFAULT_TTL"; is_resident "$a" && ttl=0
     echo "  $a:"
     [[ -n "$fit_note" ]] && echo "    # $fit_note"
-    echo "    cmd: \"$cmd\""
+    echo "    cmd: \"${cmd//\"/\\\"}\""   # escape quotes in flags (JSON args) for YAML
     echo "    ttl: $ttl"
     if needs_fork "$a"; then
       echo "    unlisted: true   # needs PrismML llama.cpp fork; hidden until built"
@@ -393,11 +433,20 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
   done
   if [[ ${#RESIDENT[@]} -gt 0 ]]; then
     echo
+    # Exclusive (default): the resident set and other models take turns on the GPU. Each model is
+    # fitted to the whole card, so co-loading makes amdgpu evict the older one into system RAM
+    # (GTT), where it runs over PCIe at a fraction of its speed. LLAMA_RESIDENT_EXCLUSIVE=0 restores
+    # the old co-loaded, never-unloaded behaviour.
     echo "groups:"
     echo "  resident:"
     echo "    swap: false"
-    echo "    exclusive: false"
-    echo "    persistent: true"
+    if [[ "${LLAMA_RESIDENT_EXCLUSIVE:-1}" == 1 ]]; then
+      echo "    exclusive: true"
+      echo "    persistent: false"
+    else
+      echo "    exclusive: false"
+      echo "    persistent: true"
+    fi
     echo "    members:"
     for r in "${RESIDENT[@]}"; do echo "      - $r"; done
     echo
@@ -406,8 +455,89 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
     echo "    preload:"
     for r in "${RESIDENT[@]}"; do echo "      - $r"; done
   fi
-} > "$SWAP_CONFIG"
-echo "wrote $SWAP_CONFIG"
+} > "$swap_out"
+[[ "$LLAMA_BACKEND" == llama-swap ]] && echo "wrote $SWAP_CONFIG"
+
+# ---- Emit ai-swap config.yaml ------------------------------------------------
+# Same models, devices, fitted contexts and flags as above, in ai-swap's schema.
+# ai-swap plans swaps against one memory budget: the discrete card's VRAM. Each
+# model is ctx-fitted to fill its card, so it reserves that card's VRAM less the
+# fit margin -- which means one model at a time, as with the exclusive group.
+yaml_list() { python3 -I -c 'import json, shlex, sys; print(json.dumps(shlex.split(sys.argv[1])))' "$1"; }
+gib() { awk -v m="$1" 'BEGIN { printf "%.1f", m / 1024 }'; }
+if [[ "$LLAMA_BACKEND" == ai-swap ]]; then
+  budget_mib=""; [[ -n "${DEV_DGPU:-}" ]] && budget_mib="${DEV_VRAM[$DEV_DGPU]:-}"
+  budget_gb="${LLAMA_AISWAP_BUDGET_GB:-}"
+  if [[ -z "$budget_gb" ]]; then
+    [[ -n "$budget_mib" ]] && budget_gb="$(awk -v m="$budget_mib" 'BEGIN { printf "%.1f", int(m / 1024 * 10) / 10 }')" || budget_gb=0
+  fi
+  peers_json='[]'
+  if [[ -f "$AISWAP_CONFIG" ]] && have yq; then
+    peers_json="$(yq -o=json -I=0 '.peers // []' "$AISWAP_CONFIG" 2>/dev/null || echo '[]')"
+  fi
+  aiswap_tmp="$(mktemp --suffix=.yaml)"
+  {
+    echo "# Generated by llama-config — do not edit by hand; re-run llama-config."
+    echo "# Peers are carried over from the previous file, so add Macs etc. under peers: here."
+    echo "node:"
+    echo "  name: $(hostname -s)"
+    echo "  listen: 0.0.0.0:$SWAP_PORT"
+    echo "  memory_budget_gb: $budget_gb   # ${DEV_DGPU:-?} VRAM"
+    echo "  port_range: [$START_PORT, $((START_PORT + 99))]"
+    if [[ ${#RESIDENT[@]} -gt 0 ]]; then
+      echo "  resident: $(printf '%s\n' "${RESIDENT[@]}" | jq -R . | jq -sc .)"
+    fi
+    echo
+    if [[ "$peers_json" == "[]" ]]; then
+      echo "# peers:"
+      echo "#   - name: studio"
+      echo "#     url: http://studio:8080"
+    else
+      echo "peers: $peers_json"
+    fi
+    echo
+    echo "defaults:"
+    echo "  ttl: ${DEFAULT_TTL}s"
+    echo "  health_timeout: 300s"
+    echo
+    echo "engines:"
+    echo "  llamacpp:"
+    echo "    bin: $LLAMA_SERVER"
+    echo "    args: $(yaml_list "--n-gpu-layers $DEFAULT_NGL --threads $DEFAULT_THREADS $COMMON_FLAGS")"
+    echo
+    echo "models:"
+    for a in "${ALIASES[@]}"; do
+      if needs_fork "$a"; then
+        echo "  # $a: skipped, needs the PrismML llama.cpp fork"
+        continue
+      fi
+      fd="${FITDEV_FOR[$a]:-}"; mem="$budget_gb"
+      if [[ -n "$fd" && -n "${DEV_VRAM[$fd]:-}" ]]; then
+        mem="$(gib $(( DEV_VRAM[$fd] - FIT_MARGIN )))"
+        # A model on another device (e.g. the iGPU) can't be planned separately
+        # against a single budget; reserve the whole budget so it swaps cleanly.
+        awk -v m="$mem" -v b="$budget_gb" 'BEGIN { exit !(b > 0 && m > b) }' && mem="$budget_gb"
+      fi
+      echo "  $a:"
+      [[ -n "${NOTE_FOR[$a]:-}" ]] && echo "    # ${NOTE_FOR[$a]}"
+      echo "    engine: llamacpp"
+      echo "    model: ${MODEL_FOR[$a]}"
+      echo "    ctx: ${CTX_FOR[$a]}"
+      echo "    memory_gb: $mem"
+      echo "    args: $(yaml_list "${FLAGS_FOR[$a]}")"
+    done
+  } > "$aiswap_tmp"
+  # Never swap in a config the server would reject.
+  if ! check_out="$(ai-swap -config "$aiswap_tmp" -check 2>&1)"; then
+    echo "$check_out" >&2
+    rm -f "$aiswap_tmp"
+    die "generated ai-swap config failed validation; $AISWAP_CONFIG left unchanged"
+  fi
+  mkdir -p "$(dirname "$AISWAP_CONFIG")"
+  [[ -f "$AISWAP_CONFIG" ]] && cp -f "$AISWAP_CONFIG" "$AISWAP_CONFIG.bak"
+  mv "$aiswap_tmp" "$AISWAP_CONFIG"
+  echo "wrote $AISWAP_CONFIG${budget_gb:+ (budget ${budget_gb} GB)}"
+fi
 
 # Choose default + small models for clients (prefer resident; small = oss/nano/mini).
 default_alias="${RESIDENT[0]:-${LISTED_ALIASES[0]:-${ALIASES[0]}}}"
@@ -498,7 +628,7 @@ fi
 mkdir -p "$(dirname "$CLAUDE_LOCAL")"
 cat > "$CLAUDE_LOCAL" <<EOF
 #!/usr/bin/env bash
-# Generated by llama-config. Run Claude Code against the local llama-swap endpoint
+# Generated by llama-config. Run Claude Code against the local ${LLAMA_BACKEND} endpoint
 # (Anthropic-native /v1/messages) — no claude-code-router needed.
 export ANTHROPIC_BASE_URL="${ENDPOINT}"
 export ANTHROPIC_API_KEY="no-key-required"
@@ -509,18 +639,24 @@ EOF
 chmod +x "$CLAUDE_LOCAL"
 echo "wrote $CLAUDE_LOCAL (main=$default_alias small=$small_alias)"
 
-# ---- Restart llama-swap and health-check -------------------------------------
-systemctl --user enable llama-swap.service >/dev/null 2>&1 || true
-systemctl --user restart llama-swap.service
+# ---- Restart the server and health-check -------------------------------------
+# Only one of the two may hold :8080; stop the other before restarting.
+OTHER_BACKEND=llama-swap; [[ "$LLAMA_BACKEND" == llama-swap ]] && OTHER_BACKEND=ai-swap
+if systemctl --user is-active "$OTHER_BACKEND.service" >/dev/null 2>&1 || systemctl --user is-enabled "$OTHER_BACKEND.service" >/dev/null 2>&1; then
+  systemctl --user disable --now "$OTHER_BACKEND.service" >/dev/null 2>&1 || true
+  echo "stopped and disabled $OTHER_BACKEND.service"
+fi
+systemctl --user enable "$LLAMA_BACKEND.service" >/dev/null 2>&1 || true
+systemctl --user restart "$LLAMA_BACKEND.service"
 echo
-echo "Waiting for llama-swap on :$SWAP_PORT ..."
+echo "Waiting for $LLAMA_BACKEND on :$SWAP_PORT ..."
 ready=0
 for _ in $(seq 1 30); do
   if curl -sf -o /dev/null "${ENDPOINT}/v1/models"; then ready=1; break; fi
   sleep 1
 done
-[[ $ready -eq 1 ]] && echo "  ok   llama-swap @ ${ENDPOINT}" \
-  || echo "  TIMEOUT (check 'journalctl --user -u llama-swap -n 50')"
+[[ $ready -eq 1 ]] && echo "  ok   $LLAMA_BACKEND @ ${ENDPOINT}" \
+  || echo "  TIMEOUT (check 'journalctl --user -u $LLAMA_BACKEND -n 50')"
 
 # ---- Remote-friendly (LAN IP) example configs --------------------------------
 mkdir -p "$EXAMPLES_DIR"
@@ -540,7 +676,7 @@ jq --arg ip "$LAN_IP" --argjson providers "$pi_providers_json" -n \
 have yq && yq -P '.' "$EXAMPLES_DIR/pi-models.json" > "$EXAMPLES_DIR/omp-models.yml"
 
 cat > "$EXAMPLES_DIR/claude-code.env" <<EOF
-# Claude Code against this host's llama-swap over the LAN.
+# Claude Code against this host's ${LLAMA_BACKEND} over the LAN.
 export ANTHROPIC_BASE_URL="${LAN_ENDPOINT}"
 export ANTHROPIC_API_KEY="no-key-required"
 export ANTHROPIC_MODEL="${default_alias}"
