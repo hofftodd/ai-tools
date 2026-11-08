@@ -63,3 +63,14 @@ ignore = Path qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
 ignore = Path qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf
 ignore = Path gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
 ignore = Path gemma-4-26b-a4b/gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf
+
+# Retired 2026-11-07 (aibench results: superseded or unused). Deleted locally,
+# kept on the NAS as cold backup, same as above. Delete a line to restore it.
+ignore = Path qwen3-coder-30b-a3b
+ignore = Path qwen3.6-35b-a3b
+ignore = Path nemotron-3.5-bolt-74b-a9b
+ignore = Path ornith-35b
+ignore = Path gpt-oss-20b
+ignore = Path glm-4.7-flash
+ignore = Path muse-glimmer-30b
+ignore = Path deepseek-v4-flash
