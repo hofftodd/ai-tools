@@ -9,8 +9,10 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 - [ ] **Review and merge Foreman PR #5** (https://github.com/hofftodd/foreman/pull/5): the
   Environment Agent and task-pipeline fixes rescued from mini-ubuntu (originally `70478f8`, 23 Oct),
   ported onto `main`, plus the new "How tests run here" note in place of the test-command
-  override. Lint, types, 261 tests and all 16 Docker tests (on mini-ubuntu) passed; GitHub's CI
-  was still running at the end of the session, so check it first.
+  override. Lint, types, 261 tests and all 16 Docker tests (on mini-ubuntu) passed, and GitHub's
+  `test` jobs passed on macOS and Ubuntu, **but the `e2e` job (Playwright UI tests) failed**:
+  https://github.com/hofftodd/foreman/actions/runs/42509555669/job/128820629160. Probably the new
+  Environment step or the settings form changed what a UI test expects; fix that before merging.
   After merging, delete the branches it supersedes:
   `git push origin --delete environment-agent rescue/environment-agent claude/beautiful-edison-pouelc`,
   and on mini-ubuntu `git -C ~/dev/ai-tools/foreman branch -D claude/beautiful-edison-pouelc`
