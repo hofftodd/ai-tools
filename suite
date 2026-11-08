@@ -151,6 +151,7 @@ cmd_links() {
 
 case "${1:-status}" in
   status)  shift || true; cmd_status "$@" ;;
+  --fetch) cmd_status --fetch ;;
   clone)   cmd_clone ;;
   pull)    cmd_pull ;;
   update)  cmd_update ;;
