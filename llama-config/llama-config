@@ -572,8 +572,9 @@ if [[ -f "$OPENCODE_CONFIG" ]]; then
   jq --argjson providers "$opencode_providers" \
      --arg default_model "$opencode_default" \
      --arg small_model "$opencode_small" \
-     'with_entries(select(.key != "provider" and .key != "model" and .key != "small_model"))
-      + {provider: $providers, model: $default_model, small_model: $small_model}' \
+     '(.provider // {} | with_entries(select(.key | startswith("llama-") | not))) as $kept
+      | with_entries(select(.key != "provider" and .key != "model" and .key != "small_model"))
+      + {provider: ($kept + $providers), model: $default_model, small_model: $small_model}' \
      "$OPENCODE_CONFIG" > "$tmp" && mv "$tmp" "$OPENCODE_CONFIG"
   echo "updated $OPENCODE_CONFIG (backup: $OPENCODE_CONFIG.bak)"
 fi
@@ -608,7 +609,8 @@ pi_providers_json="$(build_pi_providers)"
 if [[ -f "$PI_CONFIG" ]]; then
   cp -f "$PI_CONFIG" "$PI_CONFIG.bak"
   tmp="$(mktemp)"
-  jq --argjson providers "$pi_providers_json" '.providers = $providers' \
+  jq --argjson providers "$pi_providers_json" \
+     '.providers = ((.providers // {} | with_entries(select(.key | startswith("llama-") | not))) + $providers)' \
      "$PI_CONFIG" > "$tmp" && mv "$tmp" "$PI_CONFIG"
   echo "updated $PI_CONFIG (backup: $PI_CONFIG.bak)"
 fi
@@ -657,6 +659,16 @@ for _ in $(seq 1 30); do
 done
 [[ $ready -eq 1 ]] && echo "  ok   $LLAMA_BACKEND @ ${ENDPOINT}" \
   || echo "  TIMEOUT (check 'journalctl --user -u $LLAMA_BACKEND -n 50')"
+
+# ai-swap peers: give the clients a provider for every model on the other machines too
+# (ai-swap-* providers; the llama-* ones above cover this machine's models).
+if [[ "$LLAMA_BACKEND" == ai-swap && $ready -eq 1 ]]; then
+  clients="$(command -v ai-swap-clients || echo "$SCRIPT_DIR/../ai-swap-clients/ai-swap-clients")"
+  if [[ -x "$clients" ]]; then
+    sleep 3   # let ai-swap finish its first poll of the peers
+    "$clients" --endpoint "$ENDPOINT" --remote-only || echo "  (ai-swap-clients failed; peers' models not added)"
+  fi
+fi
 
 # ---- Remote-friendly (LAN IP) example configs --------------------------------
 mkdir -p "$EXAMPLES_DIR"

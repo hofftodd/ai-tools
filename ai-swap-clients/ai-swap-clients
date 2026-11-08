@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Point coding agents (pi, oh-my-pi, opencode, Claude Code) at every model in an ai-swap cluster.
+
+Reads GET <endpoint>/v1/models, which lists this machine's models and every online peer's
+(a name on two machines appears a second time as name@node), and writes one provider per
+model, all using the same ai-swap endpoint, so any agent can use a model on any machine:
+
+  pi        ~/.pi/agent/models.json         providers "ai-swap-*"
+  oh-my-pi  ~/.omp/agent/models.yml         providers "ai-swap-*"   (needs yq)
+  opencode  ~/.config/opencode/opencode.json provider  "ai-swap-*"
+  Claude    ~/.local/bin/claude-swap         wrapper: claude-swap --model <id>
+
+Only providers whose key starts with "ai-swap-" are replaced; everything else in those files
+is kept. Each file is backed up to *.bak first. Run it again after changing models or peers.
+
+  ai-swap-clients                    # every model, via http://127.0.0.1:8080
+  ai-swap-clients --remote-only      # only other machines' models (llama-config covers local ones)
+  ai-swap-clients --dry-run          # print what would be written
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+PREFIX = "ai-swap-"
+HOME = Path.home()
+PI = HOME / ".pi/agent/models.json"
+OMP = HOME / ".omp/agent/models.yml"
+OPENCODE = HOME / ".config/opencode/opencode.json"
+CLAUDE = HOME / ".local/bin/claude-swap"
+DEFAULT_CTX = 131072   # oMLX's and llama-config's default when a model doesn't state one
+MAX_OUT = 32768
+
+
+def think_format(model_id: str) -> str:
+    """pi/omp hint for how the model's chat template marks reasoning (same as llama-config)."""
+    m = model_id.lower()
+    if "qwen" in m or "ornith" in m or "thinkingcap" in m:
+        return "qwen-chat-template"
+    if "deepseek" in m:
+        return "deepseek"
+    if any(k in m for k in ("glm", "zai", "chatglm")):
+        return "zai"
+    return ""
+
+
+def key_for(model_id: str) -> str:
+    return PREFIX + re.sub(r"[^a-z0-9._-]", "-", model_id.lower())
+
+
+def fetch(endpoint: str) -> list[dict]:
+    req = urllib.request.Request(endpoint.rstrip("/") + "/v1/models", headers={"User-Agent": "ai-swap-clients"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)["data"]
+
+
+def backup(p: Path) -> None:
+    if p.exists():
+        shutil.copy2(p, p.with_name(p.name + ".bak"))
+
+
+def merge(existing: dict, new: dict) -> dict:
+    kept = {k: v for k, v in existing.items() if not k.startswith(PREFIX)}
+    return {**kept, **new}
+
+
+def pi_providers(models: list[dict], base: str) -> dict:
+    out = {}
+    for m in models:
+        compat = {"supportsDeveloperRole": False, "supportsReasoningEffort": False}
+        if tf := think_format(m["id"]):
+            compat["thinkingFormat"] = tf
+        out[key_for(m["id"])] = {
+            "baseUrl": base, "api": "openai-completions", "apiKey": "no-key-required", "compat": compat,
+            "models": [{
+                "id": m["id"], "name": f'{m["id"]} ({m["node"]})', "reasoning": True, "input": ["text"],
+                "contextWindow": m.get("context_length") or DEFAULT_CTX, "maxTokens": MAX_OUT,
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            }],
+        }
+    return out
+
+
+def opencode_providers(models: list[dict], base: str) -> dict:
+    return {key_for(m["id"]): {
+        "npm": "@ai-sdk/openai-compatible", "name": f'{m["id"]} ({m["node"]})',
+        "options": {"baseURL": base, "apiKey": "no-key-required"},
+        "models": {m["id"]: {"name": f'{m["id"]} ({m["node"]})',
+                             "limit": {"context": m.get("context_length") or DEFAULT_CTX, "output": MAX_OUT}}},
+    } for m in models}
+
+
+def write_json(p: Path, data: dict, dry: bool) -> None:
+    text = json.dumps(data, indent=2) + "\n"
+    if dry:
+        print(f"--- {p}\n{text[:1500]}{'…' if len(text) > 1500 else ''}")
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    backup(p)
+    p.write_text(text)
+    print(f"updated {p}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--endpoint", default=os.environ.get("AI_SWAP_ENDPOINT", "http://127.0.0.1:8080"))
+    ap.add_argument("--remote-only", action="store_true", help="only models served by other machines")
+    ap.add_argument("--default", help="default model for opencode and claude-swap (an id from /v1/models)")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    try:
+        models = fetch(a.endpoint)
+    except Exception as e:
+        print(f"ai-swap-clients: can't list models at {a.endpoint}: {e}", file=sys.stderr)
+        return 1
+    if a.remote_only:
+        models = [m for m in models if not m.get("local")]
+    if not models:
+        # A peer still connecting (or offline) would otherwise wipe its providers.
+        print("ai-swap-clients: no models to add; leaving client configs unchanged", file=sys.stderr)
+        return 1
+    base = a.endpoint.rstrip("/") + "/v1"
+    ids = [m["id"] for m in models]
+    if a.default and a.default not in ids:
+        print(f"ai-swap-clients: --default {a.default!r} is not one of: {', '.join(ids)}", file=sys.stderr)
+        return 1
+    print(f"{len(models)} models from {a.endpoint}: " + ", ".join(f'{m["id"]} ({m["node"]})' for m in models))
+
+    # pi
+    pi = json.loads(PI.read_text()) if PI.exists() else {}
+    pi["providers"] = merge(pi.get("providers", {}), pi_providers(models, base))
+    write_json(PI, pi, a.dry_run)
+
+    # oh-my-pi: same schema in YAML, plus auth: none. Only if omp is set up and yq can read/write YAML.
+    if OMP.parent.parent.exists() and shutil.which("yq"):
+        cur = {}
+        if OMP.exists():
+            cur = json.loads(subprocess.run(["yq", "-o=json", ".", str(OMP)], capture_output=True, text=True, check=True).stdout or "{}") or {}
+        new = {k: {**v, "auth": "none"} for k, v in pi_providers(models, base).items()}
+        cur["providers"] = merge(cur.get("providers") or {}, new)
+        if a.dry_run:
+            print(f"--- {OMP}: {len(new)} ai-swap providers")
+        else:
+            OMP.parent.mkdir(parents=True, exist_ok=True)
+            backup(OMP)
+            OMP.write_text(subprocess.run(["yq", "-P", "."], input=json.dumps(cur), capture_output=True, text=True, check=True).stdout)
+            print(f"updated {OMP}")
+
+    # opencode: keep everything else, including its default model unless --default is given.
+    try:
+        oc = json.loads(OPENCODE.read_text()) if OPENCODE.exists() else {"$schema": "https://opencode.ai/config.json"}
+    except json.JSONDecodeError as e:
+        print(f"skipping {OPENCODE}: not plain JSON ({e})", file=sys.stderr)
+        oc = None
+    if oc is not None:
+        oc["provider"] = merge(oc.get("provider", {}), opencode_providers(models, base))
+        if a.default:
+            oc["model"] = f"{key_for(a.default)}/{a.default}"
+        write_json(OPENCODE, oc, a.dry_run)
+
+    # Claude Code (Anthropic API, which ai-swap passes through to the engine).
+    default = a.default or (ids[0] if ids else "")
+    wrapper = f"""#!/usr/bin/env bash
+# Generated by ai-swap-clients. Claude Code against the ai-swap cluster at {a.endpoint}.
+# Any model on any machine: claude-swap --model <id>   (ids: curl -s {a.endpoint}/v1/models)
+export ANTHROPIC_BASE_URL="{a.endpoint}"
+export ANTHROPIC_API_KEY="no-key-required"
+export ANTHROPIC_MODEL="${{AI_SWAP_MODEL:-{default}}}"
+export ANTHROPIC_SMALL_FAST_MODEL="${{AI_SWAP_SMALL_MODEL:-$ANTHROPIC_MODEL}}"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+exec claude "$@"
+"""
+    if not a.remote_only:
+        if a.dry_run:
+            print(f"--- {CLAUDE}\n{wrapper}")
+        else:
+            CLAUDE.parent.mkdir(parents=True, exist_ok=True)
+            CLAUDE.write_text(wrapper)
+            CLAUDE.chmod(0o755)
+            print(f"wrote {CLAUDE} (default model {default})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
