@@ -613,6 +613,29 @@ if [[ -f "$PI_CONFIG" ]]; then
      '.providers = ((.providers // {} | with_entries(select(.key | startswith("llama-") | not))) + $providers)' \
      "$PI_CONFIG" > "$tmp" && mv "$tmp" "$PI_CONFIG"
   echo "updated $PI_CONFIG (backup: $PI_CONFIG.bak)"
+
+  # pi's default and enabled models live in settings.json. Drop entries whose
+  # provider/model no longer exists (a retired model leaves pi warning on every
+  # run) and fall back to the default alias; valid choices are left alone.
+  PI_SETTINGS="$(dirname "$PI_CONFIG")/settings.json"
+  if [[ -f "$PI_SETTINGS" ]]; then
+    tmp="$(mktemp)"
+    if jq --slurpfile models "$PI_CONFIG" \
+          --arg dp "${PROVIDER_PREFIX}${default_alias}" --arg dm "$default_alias" '
+        ($models[0].providers // {}) as $p
+        | def ok($prov; $mod): ($p[$prov].models // []) | map(.id) | index($mod) != null;
+          def okref: (split("/") | length == 2) and ok(split("/")[0]; split("/")[1]);
+        (if (.defaultProvider // "") != "" and (ok(.defaultProvider; .defaultModel // "") | not)
+         then .defaultProvider = $dp | .defaultModel = $dm else . end)
+        | (if has("enabledModels") then .enabledModels |= (map(select(okref))
+             | if length == 0 then [$dp + "/" + $dm] else . end) else . end)
+      ' "$PI_SETTINGS" > "$tmp" && ! cmp -s "$tmp" "$PI_SETTINGS"; then
+      cp -f "$PI_SETTINGS" "$PI_SETTINGS.bak"; mv "$tmp" "$PI_SETTINGS"
+      echo "updated $PI_SETTINGS: default model now $(jq -r '"\(.defaultProvider)/\(.defaultModel)"' "$PI_SETTINGS")"
+    else
+      rm -f "$tmp"
+    fi
+  fi
 fi
 
 if [[ -d "$(dirname "$OMP_CONFIG")" ]] && have yq; then
