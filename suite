@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# suite: manage the ai-tools suite on this machine.
+#
+# ai-tools holds small tools directly (hf-watch, llama-config, sync-models, ai-swap-clients) and
+# three projects cloned inside it as their own git repos (ai-swap, foreman, ai-bench), hidden from
+# ai-tools' git through .git/info/exclude. This script keeps that layout reproducible.
+#
+#   suite [status]   branch, ahead/behind and local changes of ai-tools and each repo
+#   suite clone      clone missing repos into place and hide them from ai-tools' git
+#   suite pull       fast-forward every repo (skips ones with local changes or diverged branches)
+#   suite update     pull, then rebuild ai-swap, refresh Python envs, restart ai-swap if rebuilt
+#   suite links      put this OS's tools on PATH (~/.local/bin)
+#
+# Options: --fetch (status: fetch first so ahead/behind is current).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+BIN="$HOME/.local/bin"
+# name|git URL. Cloned to $HERE/<name>.
+REPOS=(
+  "ai-swap|git@github.com:hofftodd/ai-swap.git"
+  "foreman|git@github.com:hofftodd/foreman.git"
+  "ai-bench|git@github.com:hofftodd/ai-bench.git"
+)
+# Go and uv live outside the default PATH on the Linux box.
+export PATH="$BIN:/usr/local/go/bin:/opt/homebrew/bin:$PATH"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()  { printf 'suite: %s\n' "$*" >&2; exit 1; }
+
+names() { local r; for r in "${REPOS[@]}"; do echo "${r%%|*}"; done; }
+url_of() { local r; for r in "${REPOS[@]}"; do [[ "${r%%|*}" == "$1" ]] && echo "${r#*|}"; done; }
+
+exclude() {   # hide the nested repos from ai-tools' git (local only, never committed)
+  local f="$HERE/.git/info/exclude" n
+  [[ -d "$HERE/.git" ]] || return 0
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  grep -qx '# Separate repos cloned here (local only, not committed)' "$f" \
+    || printf '\n# Separate repos cloned here (local only, not committed)\n' >> "$f"
+  for n in $(names); do grep -qx "/$n/" "$f" || echo "/$n/" >> "$f"; done
+}
+
+state() {   # one status line for the repo at $1
+  local d="$1" br ab ahead behind dirty
+  br="$(git -C "$d" symbolic-ref --short -q HEAD || echo "(detached)")"
+  ab="$(git -C "$d" rev-list --left-right --count "@{u}...HEAD" 2>/dev/null || echo "")"
+  dirty="$(git -C "$d" status --porcelain | wc -l | tr -d ' ')"
+  if [[ -n "$ab" ]]; then
+    behind="${ab%%[[:space:]]*}"; ahead="${ab##*[[:space:]]}"
+    ab="$( [[ $ahead == 0 && $behind == 0 ]] && echo "up to date" || echo "ahead $ahead, behind $behind")"
+  else
+    ab="no upstream"
+  fi
+  printf '  %-16s %-34s %-22s %s\n' "$(basename "$d")" "$br" "$ab" \
+    "$( [[ $dirty == 0 ]] && echo "clean" || echo "$dirty changed")"
+}
+
+cmd_status() {
+  local fetch=0 n
+  [[ "${1:-}" == "--fetch" ]] && fetch=1
+  bold "ai-tools suite on $(hostname -s)  ($HERE)"
+  for d in "$HERE" $(for n in $(names); do echo "$HERE/$n"; done); do
+    if [[ ! -d "$d/.git" ]]; then printf '  %-16s missing (run: suite clone)\n' "$(basename "$d")"; continue; fi
+    (( fetch )) && git -C "$d" fetch -q 2>/dev/null || true
+    state "$d"
+  done
+}
+
+cmd_clone() {
+  local n
+  for n in $(names); do
+    if [[ -d "$HERE/$n/.git" ]]; then echo "  $n: already here"; continue; fi
+    [[ -e "$HERE/$n" ]] && die "$HERE/$n exists but isn't a git repo"
+    echo "  cloning $n"; git clone -q "$(url_of "$n")" "$HERE/$n"
+  done
+  exclude
+  echo "  hidden from ai-tools' git via .git/info/exclude"
+}
+
+pull_one() {   # fast-forward $1; say why not if it can't
+  local d="$1" name; name="$(basename "$d")"
+  if [[ -n "$(git -C "$d" status --porcelain --untracked-files=no)" ]]; then
+    warn "  $name: local changes, not pulled"; return 1
+  fi
+  if ! git -C "$d" rev-parse -q --verify "@{u}" >/dev/null; then
+    warn "  $name: branch has no upstream, not pulled"; return 1
+  fi
+  local before; before="$(git -C "$d" rev-parse HEAD)"
+  if git -C "$d" pull -q --ff-only 2>/dev/null; then
+    [[ "$(git -C "$d" rev-parse HEAD)" == "$before" ]] && echo "  $name: up to date" \
+      || echo "  $name: $(git -C "$d" log --oneline "$before..HEAD" | wc -l | tr -d ' ') new commit(s)"
+  else
+    warn "  $name: can't fast-forward (diverged?), not pulled"; return 1
+  fi
+}
+
+cmd_pull() {
+  local n
+  pull_one "$HERE" || true
+  for n in $(names); do [[ -d "$HERE/$n/.git" ]] && { pull_one "$HERE/$n" || true; }; done
+}
+
+restart_ai_swap() {
+  if [[ "$(uname)" == Darwin ]]; then
+    local label="com.github.hofftodd.ai-swap"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      launchctl kickstart -k "gui/$(id -u)/$label" && echo "  restarted ai-swap (launchd)"
+    else
+      echo "  ai-swap isn't a LaunchAgent here; restart it yourself"
+    fi
+  elif systemctl --user is-enabled ai-swap >/dev/null 2>&1; then
+    systemctl --user restart ai-swap && echo "  restarted ai-swap (systemd --user)"
+  else
+    echo "  ai-swap isn't a systemd user service here; restart it yourself"
+  fi
+}
+
+cmd_update() {
+  cmd_pull
+  local sw="$HERE/ai-swap"
+  if [[ -d "$sw/.git" ]] && command -v go >/dev/null; then
+    local old new
+    old="$( [[ -f "$sw/ai-swap" ]] && shasum "$sw/ai-swap" | cut -d' ' -f1 || echo none)"
+    (cd "$sw" && go build -o ai-swap ./cmd/ai-swap)
+    new="$(shasum "$sw/ai-swap" | cut -d' ' -f1)"
+    if [[ "$old" != "$new" ]]; then echo "  ai-swap: rebuilt"; restart_ai_swap; else echo "  ai-swap: binary unchanged"; fi
+  elif [[ -d "$sw/.git" ]]; then
+    warn "  ai-swap: go not found, not built"
+  fi
+  local p
+  for p in foreman ai-bench; do
+    if [[ -d "$HERE/$p/.git" ]] && command -v uv >/dev/null; then
+      (cd "$HERE/$p" && uv sync -q) && echo "  $p: Python environment in sync"
+    fi
+  done
+  cmd_links
+}
+
+cmd_links() {
+  mkdir -p "$BIN"
+  local -a tools=(ai-swap/ai-swap ai-swap-clients/ai-swap-clients sync-models/sync-models)
+  [[ "$(uname)" == Linux ]] && tools+=(llama-config/llama-config)
+  local t
+  for t in "${tools[@]}"; do
+    [[ -e "$HERE/$t" ]] || continue
+    ln -sfn "$HERE/$t" "$BIN/$(basename "$t")"
+  done
+  echo "  linked into $BIN: $(for t in "${tools[@]}"; do [[ -e "$HERE/$t" ]] && printf '%s ' "$(basename "$t")"; done)"
+}
+
+case "${1:-status}" in
+  status)  shift || true; cmd_status "$@" ;;
+  clone)   cmd_clone ;;
+  pull)    cmd_pull ;;
+  update)  cmd_update ;;
+  links)   cmd_links ;;
+  -h|--help|help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try: suite help)" ;;
+esac
