@@ -1,25 +1,113 @@
-#!/usr/bin/env bash
-# Check Hugging Face for new models matching the watch list; notify once per new repo.
-# Watch list: one "search term|author (optional)|id regex (optional)" per line in watchlist.txt next to this script.
-set -euo pipefail
-HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
-STATE="$HOME/.cache/hf-watch"; mkdir -p "$STATE"
-SEEN="$STATE/seen.txt"; touch "$SEEN"
-LOG="$STATE/hf-watch.log"
+#!/usr/bin/env python3
+"""Check Hugging Face for new model repos matching watchlist.txt; notify once per run if any are new.
 
-grep -vE '^\s*(#|$)' "$HERE/watchlist.txt" | while IFS='|' read -r term author pattern; do
-  url="https://huggingface.co/api/models?search=$(printf %s "$term" | sed 's/ /%20/g')&sort=createdAt&direction=-1&limit=50"
-  [[ -n "${author:-}" ]] && url="$url&author=$author"
-  curl -fsS -m 30 "$url" | python3 -I -c '
-import json, re, sys
-pat = re.compile(sys.argv[1] or ".", re.I)
-for m in json.load(sys.stdin):
-    if pat.search(m["id"]):
-        print(m["id"], m.get("createdAt", "")[:10])' "${pattern:-}" | while read -r id created; do
-    grep -qxF "$id" "$SEEN" && continue
-    echo "$id" >> "$SEEN"
-    msg="new on Hugging Face: $id ($created), matching \"$term\""
-    echo "$(date '+%F %T') $msg" | tee -a "$LOG"
-    [[ "${HF_WATCH_QUIET:-}" == 1 ]] || osascript -e "display notification \"$id ($created)\" with title \"hf-watch: $term\" sound name \"Glass\"" || true
-  done
-done
+Watch list: one search per line in watchlist.txt next to this script (format in its header).
+State in ~/.cache/hf-watch/: seen.txt (repo ids already reported) and hf-watch.log.
+HF_WATCH_QUIET=1 records matches without notifying (use it to seed seen.txt after adding searches).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+STATE = Path.home() / ".cache" / "hf-watch"
+SEEN = STATE / "seen.txt"
+LOG = STATE / "hf-watch.log"
+# `{quant}` in an exclude regex: quantized re-uploads, drafters, base and non-chat models.
+QUANT = (r"gguf|mlx|nvfp4|mxfp|fp8|int4|int8|awq|gptq|onnx|eagle|dflash|-base\b|"
+         r"reward|embed|guard|rerank")
+# Repos with these pipeline tags aren't language models. Repos with no tag are kept:
+# several labs (Ricursive, Thinking Machines) publish their LLMs untagged.
+NOT_LLM = {
+    "automatic-speech-recognition", "text-to-speech", "text-to-audio", "audio-classification",
+    "image-classification", "object-detection", "image-segmentation", "depth-estimation",
+    "text-to-image", "image-to-image", "text-to-video", "image-to-video", "image-to-3d",
+    "feature-extraction", "sentence-similarity", "text-classification", "token-classification",
+    "zero-shot-classification", "fill-mask", "translation", "summarization", "robotics",
+    "reinforcement-learning", "time-series-forecasting", "video-classification",
+    "tabular-classification",
+}
+
+
+def log(msg: str) -> None:
+    line = f"{datetime.now():%F %T} {msg}"
+    print(line)
+    with LOG.open("a") as f:
+        f.write(line + "\n")
+
+
+def fetch(term: str, author: str) -> list[dict]:
+    q = [("sort", "createdAt"), ("direction", "-1"), ("limit", "100"),
+         ("expand[]", "createdAt"), ("expand[]", "pipeline_tag"), ("expand[]", "safetensors")]
+    if term:
+        q.append(("search", term))
+    if author:
+        q.append(("author", author))
+    url = "https://huggingface.co/api/models?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers={"User-Agent": "hf-watch"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def notify(title: str, body: str) -> None:
+    # Text goes in as arguments, never into the AppleScript source.
+    subprocess.run(["osascript", "-e", "on run argv",
+                    "-e", 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"',
+                    "-e", "end run", title, body], check=False)
+
+
+def main() -> int:
+    STATE.mkdir(parents=True, exist_ok=True)
+    SEEN.touch()
+    seen = set(SEEN.read_text().split())
+    quiet = os.environ.get("HF_WATCH_QUIET") == "1"
+    new: list[str] = []
+    errors = 0
+    for raw in (HERE / "watchlist.txt").read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        term, author, include, exclude, min_b, max_b = (
+            x.strip() for x in (raw.split(";") + [""] * 6)[:6])
+        label = term or author
+        try:
+            models = fetch(term, author)
+        except Exception as e:  # one bad search shouldn't stop the rest
+            log(f"error: {label}: {e}")
+            errors += 1
+            continue
+        inc = re.compile(include or ".", re.I)
+        exc = re.compile(exclude.replace("{quant}", QUANT), re.I) if exclude else None
+        for m in models:
+            rid = m["id"]
+            if rid in seen or not inc.search(rid) or (exc and exc.search(rid)):
+                continue
+            if m.get("pipeline_tag") in NOT_LLM:
+                continue
+            size_b = (m.get("safetensors") or {}).get("total", 0) / 1e9
+            # Sizes are known only for safetensors repos. A line with a size range skips repos of
+            # unknown size (labs' own chat models are safetensors); one without passes conversions.
+            if (min_b or max_b) and not size_b:
+                continue
+            if size_b and ((min_b and size_b < float(min_b)) or (max_b and size_b > float(max_b))):
+                continue
+            seen.add(rid)
+            with SEEN.open("a") as s:
+                s.write(rid + "\n")
+            size = f", {size_b:.0f}B" if size_b else ""
+            log(f'new on Hugging Face: {rid} ({m.get("createdAt", "")[:10]}{size}), matching "{label}"')
+            new.append(f"{rid}{size}")
+    if new and not quiet:
+        title = f"hf-watch: {len(new)} new model{'s' if len(new) > 1 else ''}"
+        more = f" +{len(new) - 3} more (~/.cache/hf-watch/hf-watch.log)" if len(new) > 3 else ""
+        notify(title, ", ".join(new[:3]) + more)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

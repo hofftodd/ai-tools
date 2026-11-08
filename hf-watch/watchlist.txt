@@ -1,7 +1,58 @@
-# search term|author (optional)|id regex (optional). Each new matching repo notifies once.
-# Inkling 2 Small: Thinking Machines' own weights, and the first GGUF/MLX conversions.
-# The regex keeps the original Inkling-Small's many conversions out.
-Inkling-2|thinkingmachines|inkling-?2
-Inkling 2 Small||inkling[-_ ]?2
-Inkling-2-Small||inkling[-_ ]?2
-Ripple-65B|ricursiveAI|ripple
+# One search per line:  search term ; author ; include regex ; exclude regex ; min B params ; max B params
+# All fields optional; an empty search term lists the author's newest repos. Regexes match the repo id,
+# case-insensitively; `{quant}` in an exclude regex stands for quantized re-uploads, drafters, base and
+# non-chat models (see hf-watch). Sizes are total parameters in billions, known only for safetensors
+# repos; a line with a size range skips repos of unknown size, one without lets GGUF/MLX conversions through. Each new matching repo is reported once.
+
+# ---- Named watches: any size -------------------------------------------------------------------------
+
+# Inkling Small (Thinking Machines, US): new Small releases from the lab (Inkling 2 Small and later,
+# plus any re-release of Inkling-Small), and the first conversions of Inkling 2 Small and later.
+# The full-size Inkling (952B) is left out: it doesn't fit.
+;thinkingmachines;small
+Inkling;;inkling[-_ ]?[2-9](\.\d+)?[-_ ]small
+Inkling;unsloth;inkling[-_ ]?[2-9](\.\d+)?[-_ ]small
+Inkling;mlx-community;inkling[-_ ]?[2-9](\.\d+)?[-_ ]small
+Inkling;Jundot;inkling[-_ ]?[2-9](\.\d+)?[-_ ]small
+
+# Ripple (Ricursive, US): anything new from the lab, and community GGUF/MLX builds.
+;ricursiveAI
+Ripple;AtomicChat;ripple
+Ripple;unsloth;ripple
+Ripple;mlx-community;ripple
+Ripple;Jundot;ripple
+
+# flint (Recursive): anything new from the lab, and new flint builds from the usual converters.
+;RecursiveSI
+flint;unsloth;flint
+flint;mlx-community;flint
+flint;Jundot;flint
+
+# Qwen4 (Alibaba): the official release under either spelling, and the first conversions.
+Qwen4;Qwen;qwen-?4(\.\d+)?([-_]|$)
+Qwen-4;Qwen;qwen-?4(\.\d+)?([-_]|$)
+Qwen4;unsloth;qwen-?4(\.\d+)?([-_]|$)
+Qwen4;mlx-community;qwen-?4(\.\d+)?([-_]|$)
+Qwen4;Jundot;qwen-?4(\.\d+)?([-_]|$)
+
+# ---- US labs: new models that fit the hardware -------------------------------------------------------
+# 7–600B total parameters: 600B fits the Mac Studio (256 GB) at 2–3 bits and ~350B at 4 bits; the
+# R9700 (32 GB) takes up to ~40B at 4 bits. NVIDIA and PrimeIntellect also republish other labs'
+# models, which are excluded by name.
+;nvidia;;{quant}|deepseek|qwen|kimi|glm|minimax|mistral|safety;7;600
+;google;;{quant}|-pt\b|shield;7;600
+;meta-llama;;{quant};7;600
+;openai;;{quant}|safeguard;7;600
+;microsoft;;{quant};7;600
+;allenai;;{quant}|-sft\b|-dpo\b|stage;7;600
+;ibm-granite;;{quant};7;600
+;arcee-ai;;{quant};7;600
+;NousResearch;;{quant};7;600
+;deepcogito;;{quant};7;600
+;LiquidAI;;{quant};7;600
+;PrimeIntellect;;{quant}|untied|deepseek|qwen|kimi|glm|minimax|mistral;7;600
+;Snowflake;;{quant};7;600
+;ServiceNow-AI;;{quant};7;600
+;Zyphra;;{quant}|legacy;7;600
+;xai-org;;{quant};7;600
+;amazon;;{quant};7;600
