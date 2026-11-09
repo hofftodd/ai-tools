@@ -33,6 +33,25 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   unloaded) isn't treated as down.
 - [ ] **Import nodes from ai-swap** (idea): a button on the Nodes page that creates one node per
   ai-swap model with its context length, instead of entering them by hand.
+- [ ] **Run a project's independent tasks in parallel.** Today each project runs one task at a
+  time (`orchestrator/main.py` `pick_ready`; an M1 simplification, `specs/000-orchestrator/plan.md`
+  "One active task per project"). On this cluster the Builder (flint, Mac) and Tester
+  (ThinkingCap, R9700) are on different machines, so serial tasks leave one idle while the other
+  works; overlapping two tasks would keep both busy without extra swaps. Do it after future-lab's
+  serial run (a baseline to compare, and no restart with tasks in flight). What it takes:
+  1. *Scheduling:* up to N active tasks per project (setting, default 1), only tasks whose deps
+     are done; SETUP runs alone first, DOCS last.
+  2. *Merge queue:* merges one at a time; after A merges, B syncs with the milestone branch and
+     the full suite runs again before B merges. A conflict sends B back to its Builder with the
+     conflict.
+  3. *Replanning:* the after-task reviews queue per project, and a review may change or remove
+     only queued tasks, never running ones.
+  4. *Coverage and diffs* are measured from a task's base commit; keep that right when the branch
+     moves under a running task.
+  5. *Placement:* the swap avoidance (`residency.py`) should prefer overlapping steps that land on
+     different machines over two steps queueing for one model.
+  Tests should cover the merge queue (two green tasks that break together, a conflict) and the
+  replanning races. Use future-lab's next phase as the first real trial.
 
 ## ai-bench
 
