@@ -44,13 +44,13 @@ flowchart LR
 
 ## Machines and network
 
-| | studio | mini-ubuntu |
-|---|---|---|
-| Hardware | Mac Studio, M5 Ultra, 256 GB unified memory | Radeon AI PRO R9700 (32 GB VRAM) |
-| Network | wired (192.168.0.208); Wi-Fi off | Wi-Fi only (192.168.0.179), IPv6 off |
-| ai-swap memory budget | 220 GB (~86% of RAM) | 31.8 GB (the card's VRAM) |
-| Engines | DwarfStar, oMLX, llama.cpp b12192 | llama.cpp (Vulkan) |
-| Always loaded | flint (36 GB) | qwen3.8-27b (30 GB) |
+| | studio | mini-ubuntu | mini-ubuntu2 |
+|---|---|---|---|
+| Hardware | Mac Studio, M5 Ultra, 256 GB unified memory | Radeon AI PRO R9700 (32 GB VRAM) | Core Ultra 5 125H, 92 GB RAM |
+| Network (reserved) | wired (192.168.0.4); Wi-Fi off | Wi-Fi only (192.168.0.3), IPv6 off | wired (192.168.0.7) |
+| ai-swap memory budget | 220 GB (~86% of RAM) | 31.8 GB (the card's VRAM) | none: serves no models |
+| Engines | DwarfStar, oMLX, llama.cpp b12192 | llama.cpp (Vulkan) | – (runs ai-factory and its Docker sandboxes) |
+| Always loaded | flint (36 GB) | qwen3.8-27b (30 GB) | – |
 
 The machines find each other by mDNS name (`studio.local`, `mini-ubuntu.local`) on a TP-Link
 router's LAN, with backups on a TrueNAS box (`truenas.local`). Two network details matter:

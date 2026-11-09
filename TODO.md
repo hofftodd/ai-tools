@@ -9,10 +9,6 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   (`<nas>/models-mac/`, size plus sampled hashes; see `~/models-archived/README.md`). The delete was
   blocked for me, so run:
   `cd ~/models-archived && rm -rf ds4 deepseek-v4-flash flint qwen3.8-27b qwen3.8-flash-next omlx sushi`
-- [ ] **Fixed addresses for the machines.** They moved on 2026-11-08 (DHCP): studio is now
-  192.168.0.4, mini-ubuntu 192.168.0.3, mini-ubuntu2 192.168.0.7, and everything finds them by
-  their `.local` names. To stop them moving, reserve them on the TP-Link router
-  (http://192.168.0.1 → Advanced → Network → DHCP Server → Address Reservation).
 
 ## ai-factory on the ai-swap cluster
 
@@ -68,7 +64,7 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 
 - [ ] mini-ubuntu is on Wi-Fi only (physical constraint; IPv6 disabled on `HoffmanNet` on
   2026-11-08). If it can be wired later, latency to it drops from ~15–35 ms to under 1 ms.
-- [ ] The Mac's Wi-Fi is off (wired on en0, 192.168.0.208). Turn it back on only if needed.
+- [ ] The Mac's Wi-Fi is off (wired on en0, 192.168.0.4). Turn it back on only if needed.
 
 ## Reference
 
