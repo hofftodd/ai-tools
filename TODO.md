@@ -39,6 +39,7 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 - [ ] **Benchmark the pending models** on the Mac (Arete-27B, Nemotron 3.5 Super VL, AesCode-32B in
   `~/models-pending`; details in `ai-bench/TODO.md`). Runs now reserve the Mac's ai-swap and unload
   its models automatically (`reserve:` in `bench-mac.yaml`), so it can stay running.
+
 ## ai-swap
 
 - [ ] **Event stream** (idea): `GET /api/events` (server-sent events) for model and reservation
