@@ -2,7 +2,7 @@
 # suite: manage the ai-tools suite on this machine.
 #
 # ai-tools holds small tools directly (hf-watch, llama-config, sync-models, ai-swap-clients) and
-# three projects cloned inside it as their own git repos (ai-swap, foreman, ai-bench), hidden from
+# three projects cloned inside it as their own git repos (ai-swap, ai-factory, ai-bench), hidden from
 # ai-tools' git through .git/info/exclude. This script keeps that layout reproducible.
 #
 #   suite [status]   branch, ahead/behind and local changes of ai-tools and each repo
@@ -19,7 +19,7 @@ BIN="$HOME/.local/bin"
 # name|git URL. Cloned to $HERE/<name>.
 REPOS=(
   "ai-swap|git@github.com:hofftodd/ai-swap.git"
-  "foreman|git@github.com:hofftodd/foreman.git"
+  "ai-factory|git@github.com:hofftodd/ai-factory.git"
   "ai-bench|git@github.com:hofftodd/ai-bench.git"
 )
 # Go and uv live outside the default PATH on the Linux box.
@@ -129,12 +129,26 @@ cmd_update() {
     warn "  ai-swap: go not found, not built"
   fi
   local p
-  for p in foreman ai-bench; do
+  for p in ai-factory ai-bench; do
     if [[ -d "$HERE/$p/.git" ]] && command -v uv >/dev/null; then
       (cd "$HERE/$p" && uv sync -q) && echo "  $p: Python environment in sync"
     fi
   done
+  build_factory_web
   cmd_links
+}
+
+build_factory_web() {   # ai-factory's dashboard is a Vite build: rebuild it after a pull
+  local web="$HERE/ai-factory/web"
+  [[ -d "$web" ]] || return 0
+  # Node may come from nvm (mini-ubuntu2), which isn't on PATH in scripts.
+  if ! command -v npm >/dev/null && [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true
+  fi
+  if ! command -v npm >/dev/null; then warn "  ai-factory: npm not found, dashboard not built"; return 0; fi
+  (cd "$web" && npm ci --silent --no-audit --no-fund && npm run -s build >/dev/null) \
+    && echo "  ai-factory: dashboard built" || warn "  ai-factory: dashboard build failed"
 }
 
 cmd_links() {

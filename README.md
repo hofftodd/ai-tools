@@ -1,7 +1,7 @@
 # ai-tools
 
 Tools for running local LLMs across two machines as one pool, using them from coding agents,
-orchestrating agent work with Foreman, and benchmarking the models. How they fit together is in
+orchestrating agent work with ai-factory, and benchmarking the models. How they fit together is in
 [ARCHITECTURE.md](ARCHITECTURE.md); open work is in [TODO.md](TODO.md).
 
 ## What's here
@@ -11,13 +11,13 @@ orchestrating agent work with Foreman, and benchmarking the models. How they fit
 | [`ai-swap/`](https://github.com/hofftodd/ai-swap) | One endpoint and chat UI for every model on every machine: starts the right engine on demand, swaps models to fit memory, forwards requests between machines | both (`:8080`) |
 | [`ai-swap-clients/`](ai-swap-clients/) | Writes pi, oh-my-pi, opencode and Claude Code configs for every model in the ai-swap cluster | both |
 | [`llama-config/`](llama-config/) | Generates the R9700 box's ai-swap config from the GGUFs in `~/models`, fitted to the GPU | Linux box |
-| [`foreman/`](https://github.com/hofftodd/foreman) | Orchestrates coding agents (planners, tester, builder) on local models, in Docker sandboxes | one host |
+| [`ai-factory/`](https://github.com/hofftodd/ai-factory) | Orchestrates coding agents (planners, tester, builder) on local models, in Docker sandboxes (formerly Foreman) | mini-ubuntu2 (`:8700`) |
 | [`ai-bench/`](https://github.com/hofftodd/ai-bench) | Benchmarks models (speed, LiveCodeBench, agentic terminal tasks) and writes the analyses | both |
 | [`hf-watch/`](hf-watch/) | Notifies you when new models of interest appear on Hugging Face | Mac |
 | [`sync-models/`](sync-models/) | Backs model files up to the NAS (two-way on the Linux box, one-way from the Mac) | both |
 | [`suite`](suite) | Clones, updates and checks the whole suite on a machine | both |
 
-`ai-swap`, `foreman` and `ai-bench` are separate GitHub repos cloned inside this folder. They're
+`ai-swap`, `ai-factory` and `ai-bench` are separate GitHub repos cloned inside this folder. They're
 hidden from this repo's git through `.git/info/exclude` (local only, never committed), so each
 keeps its own history, branches and pull requests. Everything else is part of this repo.
 
@@ -26,7 +26,7 @@ keeps its own history, branches and pull requests. Everything else is part of th
 ```bash
 git clone git@github.com:hofftodd/ai-tools.git ~/dev/ai-tools
 cd ~/dev/ai-tools
-./suite clone      # clone ai-swap, foreman and ai-bench into place
+./suite clone      # clone ai-swap, ai-factory and ai-bench into place
 ./suite update     # build ai-swap, set up the Python environments, link tools into ~/.local/bin
 ```
 

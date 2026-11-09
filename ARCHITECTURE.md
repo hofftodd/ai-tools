@@ -14,7 +14,7 @@ flowchart LR
     subgraph clients[Clients]
         ui[Chat UI]
         agents["Coding agents<br/>pi · opencode · Claude Code"]
-        foreman[Foreman]
+        ai-factory[ai-factory]
         bench[ai-bench]
     end
     subgraph studio["studio: Mac Studio, 256 GB"]
@@ -37,7 +37,7 @@ flowchart LR
 |---|---|
 | Serving models | ai-swap (one per machine) and the engines it starts |
 | Pointing clients at them | ai-swap-clients (both machines), llama-config (Linux box) |
-| Using them | coding agents, Foreman, the chat UI |
+| Using them | coding agents, ai-factory, the chat UI |
 | Measuring them | ai-bench |
 | Finding and keeping them | hf-watch, sync-models |
 | Keeping the checkout in order | suite |
@@ -120,17 +120,17 @@ Clients talk to one machine's ai-swap and reach every model through it.
   points at a model that no longer exists. It's Linux-only because it relies on a discrete GPU's
   VRAM, llama.cpp alone, systemd and GNU tools; the Mac's config is written by hand.
 
-## Foreman: agents on the pool
+## ai-factory: agents on the pool
 
-Foreman ([its ARCHITECTURE.md](https://github.com/hofftodd/foreman/blob/main/ARCHITECTURE.md))
+ai-factory ([its ARCHITECTURE.md](https://github.com/hofftodd/ai-factory/blob/main/ARCHITECTURE.md))
 runs coding agents in Docker sandboxes: planners agree the documents and the task list, a Tester
 writes tests, a Builder writes code, and an orchestrator checks and merges everything. It runs on
 one host with its containers (bind-mounted clones and a model gateway require that); a separate
 host is preferred, so agents don't compete with models for memory.
 
-Foreman reaches models through ai-swap. Its *nodes* are ai-swap endpoints, one node per model on the
+ai-factory reaches models through ai-swap. Its *nodes* are ai-swap endpoints, one node per model on the
 same URL, so each model has its own capacity and context window. The default bindings come from
-ai-bench's results (`foreman/specs/000-orchestrator/spike-notes.md`):
+ai-bench's results (`ai-factory/specs/000-orchestrator/spike-notes.md`):
 
 | Role | Model | Machine |
 |---|---|---|
@@ -140,8 +140,8 @@ ai-bench's results (`foreman/specs/000-orchestrator/spike-notes.md`):
 
 **Avoiding swaps.** An agent step uses its model for minutes, with pauses between requests while
 its tools run, but ai-swap only protects a model while a request is in flight. Two steps whose
-models don't fit on one machine would swap each other out on almost every turn. So Foreman reads
-ai-swap's status every few seconds (`foreman/src/foreman/residency.py`) and holds back work whose
+models don't fit on one machine would swap each other out on almost every turn. So ai-factory reads
+ai-swap's status every few seconds (`ai-factory/src/ai_factory/residency.py`) and holds back work whose
 model would push out a model another running step is using, works out the victim the way ai-swap
 would, starts already-loaded work first, and treats a reserved machine as busy. The project
 settings page warns when two agents' models can't share a machine. The bindings above never
@@ -161,7 +161,7 @@ results, dashboards and the analyses that chose the models above. Each machine h
 Both configs have `reserve:`, so every run reserves its machine's ai-swap: it unloads ai-swap's
 models (freeing the memory on the Mac), sends its token with every request through ai-swap
 (including the shell steps that free the GPU, as `$AI_SWAP_LOCK`), renews the reservation, and
-releases it at the end, even on errors. Agents and Foreman see the machine as reserved and wait.
+releases it at the end, even on errors. Agents and ai-factory see the machine as reserved and wait.
 The ai-swap backend also refuses a model this machine doesn't serve, so a result can't be run on
 the other machine but labelled with this one's hardware.
 
@@ -199,7 +199,7 @@ flowchart LR
 | Agent configs | `~/.pi/agent/models.json`, `~/.config/opencode/opencode.json`, `~/.local/bin/claude-swap` | same, plus `~/.omp/agent/models.yml`, `claude-local` |
 | Tools on PATH | `~/.local/bin`: ai-swap, ai-swap-clients, sync-models | the same plus llama-config |
 | oMLX settings | `~/.omlx/settings.json`, `~/.omlx/model_settings.json` (MTP per model) | — |
-| Foreman | — | `~/.config/foreman/` (service and env files, not installed) |
+| ai-factory | — | `~/.config/ai-factory/` (service and env files, not installed) |
 | hf-watch | LaunchAgent `com.thoffman.hf-watch`, state `~/.cache/hf-watch/` | — |
 
 ## Ports
@@ -211,22 +211,22 @@ flowchart LR
 | 5800–5899 | engines started by ai-swap on the Linux box |
 | 8000, 8010, 12345, 5896–5897 | engines started directly by ai-bench on the Mac (DwarfStar, oMLX, sushi, llama.cpp) |
 | 8090 | Strata, started by ai-bench on the Linux box |
-| 8700, 8701 | Foreman's dashboard and its model gateway (on its host) |
+| 8700, 8701 | ai-factory's dashboard and its model gateway (on its host) |
 
 ## Design choices
 
 - **Plain HTTP between everything.** Every interaction is request and response, often streamed:
   chat, agent turns, forwards between machines, status polls, reservations. Each tool keeps its
-  own state (ai-swap in memory, Foreman in SQLite, ai-bench in files). A message broker would add
+  own state (ai-swap in memory, ai-factory in SQLite, ai-bench in files). A message broker would add
   a service to run and a single point of failure without solving a problem the tools have; if
   polling ever becomes the bottleneck, an event stream from ai-swap (server-sent events) is the
   next step.
 - **No central coordinator.** Every machine runs the same ai-swap and owns its own models; any
   machine is a front door, and losing one loses only its models.
-- **Foreman decides what ai-swap can't see.** ai-swap knows requests; Foreman knows that an agent
-  step spans many of them. Swap avoidance lives in Foreman, built on ai-swap's status.
+- **ai-factory decides what ai-swap can't see.** ai-swap knows requests; ai-factory knows that an agent
+  step spans many of them. Swap avoidance lives in ai-factory, built on ai-swap's status.
 - **Reservations instead of conventions.** Benchmarks used to rely on nobody else touching the
   machine; now the machine itself refuses other work while a run holds it.
-- **Separate repos, one folder.** ai-swap, Foreman and ai-bench are standalone projects with
+- **Separate repos, one folder.** ai-swap, ai-factory and ai-bench are standalone projects with
   their own histories and pull requests; `suite` makes the shared layout reproducible on any
   machine.
