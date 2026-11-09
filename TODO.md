@@ -33,6 +33,16 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   unloaded) isn't treated as down.
 - [ ] **Import nodes from ai-swap** (idea): a button on the Nodes page that creates one node per
   ai-swap model with its context length, instead of entering them by hand.
+- [ ] **Tasks cut off by a restart wait for a manual Retry.** `orchestrator/main.py` `recover()`
+  marks running tasks `failed` ("orchestrator restarted during run; retry to continue") but never
+  calls `escalation.after_failure`, so nothing requeues them; the README says they are "retried by
+  the escalation ladder". Seen on future-lab's T1 after deploying ai-factory#16. Either requeue
+  them (an interrupted attempt shouldn't count as a failure) or fix the README.
+- [ ] **`doctor` and image builds miss a Docker permission problem.** `ai-factory doctor` checks
+  Docker as whoever runs it, not as the service, so it passed while the systemd service (started
+  before the user joined the `docker` group) couldn't reach the socket. And a build that fails
+  with "permission denied" on the Docker socket is sent back to the Environment Agent as if its
+  Dockerfile were wrong; it should go straight to the user.
 - [ ] **Run a project's independent tasks in parallel.** Today each project runs one task at a
   time (`orchestrator/main.py` `pick_ready`; an M1 simplification, `specs/000-orchestrator/plan.md`
   "One active task per project"). On this cluster the Builder (flint, Mac) and Tester
