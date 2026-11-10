@@ -2,7 +2,7 @@
 # suite: manage the ai-tools suite on this machine.
 #
 # ai-tools holds small tools directly (hf-watch, llama-config, sync-models, ai-swap-clients) and
-# three projects cloned inside it as their own git repos (ai-swap, ai-factory, ai-bench), hidden from
+# four projects cloned inside it as their own git repos (ai-swap, ai-factory, ai-bench, ai-delegate), hidden from
 # ai-tools' git through .git/info/exclude. This script keeps that layout reproducible.
 #
 #   suite [status]   branch, ahead/behind and local changes of ai-tools and each repo
@@ -21,6 +21,7 @@ REPOS=(
   "ai-swap|git@github.com:hofftodd/ai-swap.git"
   "ai-factory|git@github.com:hofftodd/ai-factory.git"
   "ai-bench|git@github.com:hofftodd/ai-bench.git"
+  "ai-delegate|git@github.com:hofftodd/ai-delegate.git"
 )
 # Go and uv live outside the default PATH on the Linux box.
 export PATH="$BIN:/usr/local/go/bin:/opt/homebrew/bin:$PATH"

@@ -39,6 +39,7 @@ flowchart LR
 | Pointing clients at them | ai-swap-clients (both machines), llama-config (Linux box) |
 | Using them | coding agents, ai-factory, the chat UI |
 | Measuring them | ai-bench |
+| Handing work to them from Claude Code | ai-delegate (planned) |
 | Finding and keeping them | hf-watch, sync-models |
 | Keeping the checkout in order | suite |
 
@@ -227,6 +228,6 @@ flowchart LR
   step spans many of them. Swap avoidance lives in ai-factory, built on ai-swap's status.
 - **Reservations instead of conventions.** Benchmarks used to rely on nobody else touching the
   machine; now the machine itself refuses other work while a run holds it.
-- **Separate repos, one folder.** ai-swap, ai-factory and ai-bench are standalone projects with
+- **Separate repos, one folder.** ai-swap, ai-factory, ai-bench and ai-delegate are standalone projects with
   their own histories and pull requests; `suite` makes the shared layout reproducible on any
   machine.

@@ -13,11 +13,12 @@ orchestrating agent work with ai-factory, and benchmarking the models. How they 
 | [`llama-config/`](llama-config/) | Generates the R9700 box's ai-swap config from the GGUFs in `~/models`, fitted to the GPU | Linux box |
 | [`ai-factory/`](https://github.com/hofftodd/ai-factory) | Orchestrates coding agents (planners, tester, builder) on local models, in Docker sandboxes (formerly Foreman) | mini-ubuntu2 (`:8700`) |
 | [`ai-bench/`](https://github.com/hofftodd/ai-bench) | Benchmarks models (speed, LiveCodeBench, agentic terminal tasks) and writes the analyses | both |
+| [`ai-delegate/`](https://github.com/hofftodd/ai-delegate) | MCP server that lets Claude Code hand work to the local models (planned; design only) | where Claude Code runs |
 | [`hf-watch/`](hf-watch/) | Notifies you when new models of interest appear on Hugging Face | Mac |
 | [`sync-models/`](sync-models/) | Backs model files up to the NAS (two-way on the Linux box, one-way from the Mac) | both |
 | [`suite`](suite) | Clones, updates and checks the whole suite on a machine | both |
 
-`ai-swap`, `ai-factory` and `ai-bench` are separate GitHub repos cloned inside this folder. They're
+`ai-swap`, `ai-factory`, `ai-bench` and `ai-delegate` are separate GitHub repos cloned inside this folder. They're
 hidden from this repo's git through `.git/info/exclude` (local only, never committed), so each
 keeps its own history, branches and pull requests. Everything else is part of this repo.
 
@@ -26,7 +27,7 @@ keeps its own history, branches and pull requests. Everything else is part of th
 ```bash
 git clone git@github.com:hofftodd/ai-tools.git ~/dev/ai-tools
 cd ~/dev/ai-tools
-./suite clone      # clone ai-swap, ai-factory and ai-bench into place
+./suite clone      # clone ai-swap, ai-factory, ai-bench and ai-delegate into place
 ./suite update     # build ai-swap, set up the Python environments, link tools into ~/.local/bin
 ```
 
