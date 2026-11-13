@@ -13,7 +13,7 @@ orchestrating agent work with ai-factory, and benchmarking the models. How they 
 | [`llama-config/`](llama-config/) | Generates the R9700 box's ai-swap config from the GGUFs in `~/models`, fitted to the GPU | Linux box |
 | [`ai-factory/`](https://github.com/hofftodd/ai-factory) | Orchestrates coding agents (planners, tester, builder) on local models, in Docker sandboxes (formerly Foreman) | mini-ubuntu2 (`:8700`) |
 | [`ai-bench/`](https://github.com/hofftodd/ai-bench) | Benchmarks models (speed, LiveCodeBench, agentic terminal tasks) and writes the analyses | both |
-| [`ai-delegate/`](https://github.com/hofftodd/ai-delegate) | MCP server that lets Claude Code hand work to the local models (planned; design only) | where Claude Code runs |
+| [`ai-delegate/`](https://github.com/hofftodd/ai-delegate) | MCP server that lets Claude Code hand work to the local models: questions, reviews, and coding jobs in a sandbox that come back as a diff | where Claude Code runs |
 | [`hf-watch/`](hf-watch/) | Notifies you when new models of interest appear on Hugging Face | Mac |
 | [`sync-models/`](sync-models/) | Backs model files up to the NAS (two-way on the Linux box, one-way from the Mac) | both |
 | [`suite`](suite) | Clones, updates and checks the whole suite on a machine | both |

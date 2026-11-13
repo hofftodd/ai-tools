@@ -130,7 +130,7 @@ cmd_update() {
     warn "  ai-swap: go not found, not built"
   fi
   local p
-  for p in ai-factory ai-bench; do
+  for p in ai-factory ai-bench ai-delegate; do
     if [[ -d "$HERE/$p/.git" ]] && command -v uv >/dev/null; then
       (cd "$HERE/$p" && uv sync -q) && echo "  $p: Python environment in sync"
     fi

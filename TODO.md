@@ -63,6 +63,21 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   Tests should cover the merge queue (two green tasks that break together, a conflict) and the
   replanning races. Use future-lab's next phase as the first real trial.
 
+## ai-delegate
+
+- [ ] **Register it and try it on real work** (on main since 2026-11-13): `uv run
+  ai-delegate image && uv run ai-delegate routes --write && uv run ai-delegate skill`, then
+  `claude mcp add -s user ai-delegate -- uv run --project ~/dev/ai-tools/ai-delegate ai-delegate
+  serve`. Copy `examples/config.yaml` first for the ai-bench name map (`ds4-q4` and others).
+  Keep the trial notes DESIGN.md asks for (kept / fixed / redone); they decide what's next.
+- [ ] **Run `routes --write` after new ai-bench results**; it lists the models it couldn't match.
+- [ ] **Watch `ai-delegate stats`** during the trial: tokens saved net of redone work, per tool
+  and model. The native side is an estimate; compare it with real session usage when possible.
+- [ ] Web research for local models (port ai-factory's `research.py`) needs a SearXNG instance
+  on the LAN first.
+- [ ] Idea: a `sandbox-exec` (Seatbelt) level on macOS between `docker` and `local`, so jobs
+  can use the Mac's toolchains with writes limited to the clone (DESIGN.md, Delegation safety).
+
 ## ai-bench
 
 - [ ] **Benchmark the pending models** on the Mac (Arete-27B, Nemotron 3.5 Super VL, AesCode-32B in
@@ -70,6 +85,15 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   its models automatically (`reserve:` in `bench-mac.yaml`), so it can stay running.
 
 ## ai-swap
+
+- [ ] **Smarter placement is on main, not deployed** (2026-11-13): a model on
+  several machines is served where it's loaded, else where it fits in free memory, before
+  local-first; reserved machines are skipped. Pin ai-factory's node ids first (below), then
+  `suite update` on both machines (it rebuilds and restarts ai-swap).
+- [ ] **ai-factory's residency vs placement:** `residency.py` maps the bare id `flint` to the
+  Mac, but with placement a bare `flint` can now be served by mini-ubuntu's copy when only that
+  one is loaded. ai-factory nodes should use pinned ids (`flint@studio`) wherever a model is on
+  both machines (flint, qwen3.8-27b), or residency should read the placement outcome.
 
 - [ ] **Event stream** (idea): `GET /api/events` (server-sent events) for model and reservation
   changes, to replace the UI's 3 s polling, the peers' 10 s polling and ai-factory's residency reads.
