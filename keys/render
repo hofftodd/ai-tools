@@ -128,8 +128,17 @@ restart() {
     launchd)
       local plist=~/Library/LaunchAgents/$name.plist
       launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
-      launchctl bootstrap "gui/$(id -u)" "$plist"
-      echo "  reloaded $name" ;;
+      # bootout returns before the agent is fully gone, and bootstrapping too soon fails with
+      # "Bootstrap failed: 5: Input/output error", so wait for it and retry.
+      local tries=0
+      until launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; do
+        if (( ++tries >= 15 )); then
+          echo "render: couldn't reload $name; run: launchctl bootstrap gui/$(id -u) $plist" >&2
+          status=1; break
+        fi
+        sleep 1
+      done
+      launchctl print "gui/$(id -u)/$name" >/dev/null 2>&1 && echo "  reloaded $name" ;;
     none) echo "  no service to restart" ;;
   esac
 }
