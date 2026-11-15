@@ -648,7 +648,9 @@ if [[ -f "$PI_CONFIG" ]]; then
 fi
 
 if [[ -d "$(dirname "$OMP_CONFIG")" ]] && have yq; then
-  omp_providers="$(build_pi_providers | jq 'with_entries(.value += {auth: "none"})')"
+  # auth: none tells omp to send no key; only right when ai-swap has none.
+  if [[ -n "$SWAP_KEY" ]]; then omp_providers="$(build_pi_providers)"
+  else omp_providers="$(build_pi_providers | jq 'with_entries(.value += {auth: "none"})')"; fi
   if [[ -f "$OMP_CONFIG" ]]; then cp -f "$OMP_CONFIG" "$OMP_CONFIG.bak"; existing_json="$(yq -o=json '.' "$OMP_CONFIG")"; else existing_json='{"providers":{}}'; fi
   merged_json="$(jq --argjson new "$omp_providers" '
     .providers //= {}
