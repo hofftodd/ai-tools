@@ -1,0 +1,22 @@
+# systemd user unit for ai-search. Install (on the host that runs it, mini-ubuntu2):
+#
+#   mkdir -p ~/.config/ai-search ~/.config/systemd/user
+#   cp ~/dev/ai-tools/ai-search/env.example ~/.config/ai-search/env    # then add the key
+#   chmod 600 ~/.config/ai-search/env
+#   ln -sf ~/dev/ai-tools/ai-search/ai-search.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ai-search
+#   journalctl --user -u ai-search -f                                    # one line per search
+#
+# Remove: systemctl --user disable --now ai-search && rm ~/.config/systemd/user/ai-search.service
+[Unit]
+Description=ai-search: web search for the suite's local models (SearXNG-compatible JSON API)
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/ai-search/env
+ExecStart=/usr/bin/python3 %h/dev/ai-tools/ai-search/ai-search
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -73,8 +73,8 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 - [ ] **Run `routes --write` after new ai-bench results**; it lists the models it couldn't match.
 - [ ] **Watch `ai-delegate stats`** during the trial: tokens saved net of redone work, per tool
   and model. The native side is an estimate; compare it with real session usage when possible.
-- [ ] Web research for local models (port ai-factory's `research.py`) needs a SearXNG instance
-  on the LAN first.
+- [ ] Web research for local models (port ai-factory's `research.py`): search through
+  `ai-search` on mini-ubuntu2 (`http://mini-ubuntu2.local:8889`, Brave behind it).
 - [ ] Idea: a `sandbox-exec` (Seatbelt) level on macOS between `docker` and `local`, so jobs
   can use the Mac's toolchains with writes limited to the clone (DESIGN.md, Delegation safety).
 

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""ai-search: one web search endpoint for the suite's local models, in SearXNG's JSON shape.
+
+Clients (ai-factory's planner research, ai-delegate's web research) call
+
+    GET /search?q=<query>&format=json[&count=N][&pageno=N][&language=en][&time_range=week]
+
+and get SearXNG's response shape back ({"query", "number_of_results", "results": [{"title",
+"url", "content", "engine", ...}]}), whatever answers behind it. So a client written for
+SearXNG works unchanged, and the backend can change without touching any client:
+
+- ``brave``: the Brave Search API (needs BRAVE_API_KEY). The default.
+- ``searxng``: a SearXNG instance (AI_SEARCH_SEARXNG_URL), passed through.
+
+API keys stay here, on the host that runs ai-search; clients and sandboxes never see them.
+Repeated queries come from a cache, calls to the backend are spaced to its rate limit, and an
+optional monthly cap stops before a paid quota runs out.
+
+    GET /healthz   backend, cache and usage, as JSON
+
+Python 3 standard library only. Settings come from the environment (see README.md).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import html
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "1"
+MAX_COUNT = 20
+TIME_RANGES = ("day", "week", "month", "year")
+
+
+class BackendError(Exception):
+    """The backend failed; ``status`` is the HTTP status to answer with."""
+
+    def __init__(self, message: str, status: int = 502):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class Query:
+    q: str
+    count: int = 10
+    page: int = 1  # 1-based, as SearXNG's pageno
+    language: str = ""  # e.g. "en"; "" or "all" for any
+    time_range: str = ""  # "", day, week, month or year
+
+    def key(self, backend: str) -> tuple[str, ...]:
+        return (backend, self.q, str(self.count), str(self.page), self.language, self.time_range)
+
+
+@dataclass
+class Result:
+    title: str
+    url: str
+    content: str = ""
+    engine: str = ""
+    published: str = ""  # as the backend gives it; "" if unknown
+
+    def searx(self, position: int) -> dict[str, object]:
+        out: dict[str, object] = {
+            "title": self.title,
+            "url": self.url,
+            "content": self.content,
+            "engine": self.engine,
+            "engines": [self.engine],
+            "category": "general",
+            "positions": [position],
+            "score": 1.0 / position,
+        }
+        if self.published:
+            out["publishedDate"] = self.published
+        return out
+
+
+# -- backends -------------------------------------------------------------------------------
+#
+# A backend is anything with a ``name``, a ``min_interval`` (seconds between calls) and
+# ``search(Query) -> list[Result]`` that raises BackendError. Add one by writing a class and
+# registering it in BACKENDS.
+
+
+def _get_json(url: str, headers: dict[str, str], timeout: float) -> object:
+    req = urllib.request.Request(url, headers={"Accept": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read(400).decode(errors="replace").strip()
+        raise BackendError(f"HTTP {e.code}: {body}", 429 if e.code == 429 else 502) from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise BackendError(f"unreachable: {e}") from e
+    except ValueError as e:
+        raise BackendError(f"not JSON: {e}") from e
+
+
+def _plain(text: str) -> str:
+    """Brave marks matches with <strong>; clients want plain text."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+
+
+class Brave:
+    name = "brave"
+    URL = "https://api.search.brave.com/res/v1/web/search"
+    FRESHNESS = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}
+
+    def __init__(self, key: str, qps: float = 1.0, timeout: float = 15.0):
+        if not key:
+            raise SystemExit("ai-search: BRAVE_API_KEY is not set (backend brave)")
+        self.key = key
+        self.min_interval = 1.0 / qps if qps > 0 else 0.0
+        self.timeout = timeout
+
+    def search(self, q: Query) -> list[Result]:
+        params = {"q": q.q, "count": str(q.count), "offset": str(q.page - 1)}
+        if q.language and q.language != "all":
+            params["search_lang"] = q.language.split("-")[0]
+        if q.time_range:
+            params["freshness"] = self.FRESHNESS[q.time_range]
+        url = f"{self.URL}?{urllib.parse.urlencode(params)}"
+        doc = _get_json(url, {"X-Subscription-Token": self.key}, self.timeout)
+        rows = ((doc or {}).get("web") or {}).get("results") or [] if isinstance(doc, dict) else []
+        out = []
+        for r in rows:
+            snippets = [r.get("description", ""), *(r.get("extra_snippets") or [])]
+            out.append(
+                Result(
+                    title=_plain(r.get("title", "")),
+                    url=str(r.get("url", "")),
+                    content=" … ".join(s for s in map(_plain, snippets) if s),
+                    engine=self.name,
+                    published=str(r.get("page_age") or r.get("age") or ""),
+                )
+            )
+        return out
+
+
+class SearXNG:
+    name = "searxng"
+
+    def __init__(self, base: str, timeout: float = 20.0):
+        if not base:
+            raise SystemExit("ai-search: AI_SEARCH_SEARXNG_URL is not set (backend searxng)")
+        self.base = base.rstrip("/")
+        self.min_interval = 0.0
+        self.timeout = timeout
+
+    def search(self, q: Query) -> list[Result]:
+        params = {"q": q.q, "format": "json", "pageno": str(q.page)}
+        if q.language:
+            params["language"] = q.language
+        if q.time_range:
+            params["time_range"] = q.time_range
+        doc = _get_json(f"{self.base}/search?{urllib.parse.urlencode(params)}", {}, self.timeout)
+        rows = doc.get("results") or [] if isinstance(doc, dict) else []
+        return [
+            Result(
+                title=str(r.get("title", "")),
+                url=str(r.get("url", "")),
+                content=str(r.get("content", "")),
+                engine=str(r.get("engine", self.name)),
+                published=str(r.get("publishedDate") or ""),
+            )
+            for r in rows[: q.count]
+        ]
+
+
+BACKENDS = {
+    "brave": lambda env: Brave(env.get("BRAVE_API_KEY", ""), float(env.get("AI_SEARCH_QPS", "1"))),
+    "searxng": lambda env: SearXNG(env.get("AI_SEARCH_SEARXNG_URL", "")),
+}
+
+
+# -- the service ----------------------------------------------------------------------------
+
+
+@dataclass
+class Usage:
+    """Backend calls per calendar month, kept on disk so a restart doesn't reset the cap."""
+
+    path: Path
+    month: str = ""
+    calls: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            doc = json.loads(self.path.read_text())
+            self.month, self.calls = str(doc["month"]), int(doc["calls"])
+        except (OSError, ValueError, KeyError):
+            pass
+        self._roll()
+
+    def _roll(self) -> None:
+        now = time.strftime("%Y-%m")
+        if self.month != now:
+            self.month, self.calls = now, 0
+
+    def take(self, cap: int) -> None:
+        with self.lock:
+            self._roll()
+            if cap and self.calls >= cap:
+                raise BackendError(f"monthly cap of {cap} backend calls reached", 429)
+            self.calls += 1
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"month": self.month, "calls": self.calls}))
+            tmp.replace(self.path)
+
+
+class Search:
+    def __init__(
+        self,
+        backend,  # noqa: ANN001 - any backend, see above
+        usage: Usage,
+        cache_ttl: float = 86400,
+        cache_size: int = 2000,
+        monthly_cap: int = 0,
+    ):
+        self.backend = backend
+        self.usage = usage
+        self.cache_ttl = cache_ttl
+        self.cache_size = cache_size
+        self.monthly_cap = monthly_cap
+        self.cache: OrderedDict[tuple[str, ...], tuple[float, list[Result]]] = OrderedDict()
+        self.hits = 0
+        self.lock = threading.Lock()  # the cache
+        self.pace = threading.Lock()  # one backend call at a time, spaced to its rate limit
+        self.last_call = 0.0
+
+    def search(self, q: Query) -> tuple[list[Result], bool]:
+        """(results, cached)."""
+        key = q.key(self.backend.name)
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit and time.monotonic() - hit[0] < self.cache_ttl:
+                self.cache.move_to_end(key)
+                self.hits += 1
+                return hit[1], True
+        with self.pace:
+            with self.lock:  # another thread may have fetched it while this one waited
+                hit = self.cache.get(key)
+                if hit and time.monotonic() - hit[0] < self.cache_ttl:
+                    self.hits += 1
+                    return hit[1], True
+            results = self._call(q)
+        with self.lock:
+            self.cache[key] = (time.monotonic(), results)
+            self.cache.move_to_end(key)
+            while len(self.cache) > self.cache_size:
+                self.cache.popitem(last=False)
+        return results, False
+
+    def _call(self, q: Query) -> list[Result]:
+        for attempt in (1, 2):
+            wait = self.last_call + self.backend.min_interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self.usage.take(self.monthly_cap)
+            self.last_call = time.monotonic()
+            try:
+                return self.backend.search(q)
+            except BackendError as e:
+                if e.status != 429 or attempt == 2:
+                    raise
+                time.sleep(max(1.0, self.backend.min_interval))  # rate-limited: once more
+        raise AssertionError("unreachable")
+
+    def health(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "version": VERSION,
+            "backend": self.backend.name,
+            "cache": {"entries": len(self.cache), "hits": self.hits, "ttl_s": self.cache_ttl},
+            "usage": {"month": self.usage.month, "calls": self.usage.calls,
+                      "cap": self.monthly_cap or None},
+        }  # fmt: skip
+
+
+def parse_query(params: dict[str, list[str]]) -> Query:
+    def one(name: str, default: str = "") -> str:
+        return (params.get(name) or [default])[0].strip()
+
+    q = one("q")
+    if not q:
+        raise BackendError("missing q", 400)
+    if one("format", "json") != "json":
+        raise BackendError("only format=json is supported", 400)
+    try:
+        count = max(1, min(MAX_COUNT, int(one("count", "10"))))
+        page = max(1, min(10, int(one("pageno", "1"))))
+    except ValueError as e:
+        raise BackendError("count and pageno must be numbers", 400) from e
+    time_range = one("time_range")
+    if time_range and time_range not in TIME_RANGES:
+        raise BackendError(f"time_range must be one of {', '.join(TIME_RANGES)}", 400)
+    return Query(q[:400], count, page, one("language"), time_range)
+
+
+def make_handler(search: Search, token: str):  # noqa: ANN201
+    class Handler(BaseHTTPRequestHandler):
+        server_version = f"ai-search/{VERSION}"
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server's name
+            url = urllib.parse.urlsplit(self.path)
+            params = urllib.parse.parse_qs(url.query)
+            if url.path == "/healthz":
+                return self._send(200, search.health())
+            if url.path != "/search":
+                return self._send(404, {"error": "not found: use /search or /healthz"})
+            if token and not self._authorized(params):
+                return self._send(401, {"error": "missing or wrong token"})
+            started = time.monotonic()
+            try:
+                q = parse_query(params)
+                results, cached = search.search(q)
+            except BackendError as e:
+                self._log(f"error {e.status} {e}")
+                return self._send(e.status, {"error": str(e)})
+            self._log(
+                f"{search.backend.name} {'cache' if cached else 'call'} "
+                f"{len(results)} results {time.monotonic() - started:.2f}s q={q.q!r}"
+            )
+            self._send(200, {
+                "query": q.q,
+                "number_of_results": len(results),
+                "results": [r.searx(i) for i, r in enumerate(results, 1)],
+                "answers": [], "corrections": [], "infoboxes": [], "suggestions": [],
+                "unresponsive_engines": [],
+            })  # fmt: skip
+
+        def _authorized(self, params: dict[str, list[str]]) -> bool:
+            given = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            return (given or (params.get("token") or [""])[0]) == token
+
+        def _send(self, status: int, doc: dict[str, object]) -> None:
+            body = json.dumps(doc).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _log(self, msg: str) -> None:
+            print(f"{self.client_address[0]} {msg}", file=sys.stderr, flush=True)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass  # one line per search from _log instead
+
+    return Handler
+
+
+def build(env: dict[str, str]) -> Search:
+    name = env.get("AI_SEARCH_BACKEND", "brave")
+    if name not in BACKENDS:
+        raise SystemExit(f"ai-search: unknown backend {name!r} (one of {', '.join(BACKENDS)})")
+    state = Path(env.get("AI_SEARCH_STATE", "~/.local/state/ai-search")).expanduser()
+    return Search(
+        BACKENDS[name](env),
+        Usage(state / "usage.json"),
+        cache_ttl=float(env.get("AI_SEARCH_CACHE_TTL", "86400")),
+        monthly_cap=int(env.get("AI_SEARCH_MONTHLY_CAP", "0")),
+    )
+
+
+def main() -> None:
+    env = dict(os.environ)
+    search = build(env)
+    host, _, port = env.get("AI_SEARCH_BIND", "0.0.0.0:8889").rpartition(":")
+    server = ThreadingHTTPServer((host or "0.0.0.0", int(port)), make_handler(
+        search, env.get("AI_SEARCH_TOKEN", "")))  # fmt: skip
+    print(
+        f"ai-search {VERSION}: {search.backend.name} on {host}:{port}", file=sys.stderr, flush=True
+    )
+    with contextlib.suppress(KeyboardInterrupt):
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
