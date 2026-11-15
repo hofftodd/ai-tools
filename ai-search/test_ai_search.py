@@ -1,6 +1,7 @@
 """Tests for ai-search: python3 -m unittest -v (from this directory). Standard library only."""
 
 import json
+import sys
 import tempfile
 import threading
 import time
@@ -16,6 +17,7 @@ _loader = SourceFileLoader("ai_search", str(HERE / "ai-search"))
 _spec = spec_from_loader("ai_search", _loader)
 assert _spec is not None
 ais = module_from_spec(_spec)
+sys.modules["ai_search"] = ais  # dataclasses look their module up here (Python 3.14)
 _loader.exec_module(ais)
 
 BRAVE_DOC = {
