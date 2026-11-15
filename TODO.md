@@ -10,12 +10,15 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   blocked for me, so run:
   `cd ~/models-archived && rm -rf ds4 deepseek-v4-flash flint qwen3.8-27b qwen3.8-flash-next omlx sushi`
 
-- [ ] **Switch the keys on** (`keys/README.md` has the steps): install the 1Password CLI (`op`)
-  on studio, mini-ubuntu and mini-ubuntu2; create the `ai-suite` vault and a service account for
-  the two Linux boxes; enter the existing values (Brave, daily-update's tokens and OAuth file).
-  Then `keys/new-tokens` and `keys/render <machine>` on all three, restarting the three ai-swaps
-  together so they share the key. Every piece of the suite already reads the keys when set.
-- [ ] **Delete the retired `FOREMAN_TOKEN`** env file on mini-ubuntu (`~/.config/foreman/foreman.env`).
+- Keys switched on 2026-11-15: ai-swap's key on all three machines, ai-search's token, all from
+  the `ai-suite` vault via `keys/render`. Shells on studio and mini-ubuntu load
+  `~/.config/ai-swap/env`.
+- [ ] **Change `AI_FACTORY_TOKEN`** (it was copied, not regenerated, and has been in ai-factory's
+  access log): regenerate the item, `keys/render mini-ubuntu2`, sign in to the dashboard again.
+- [ ] **Store daily-update's Google files** (`credentials.json`, `data/google/token.json`) as
+  1Password Documents (`op document create … --vault ai-suite`).
+- [ ] **Delete the pre-key env backups** (`*.bak-20261115-*`, mode 600) once the keys have run a
+  while.
 
 ## ai-factory on the ai-swap cluster
 
@@ -75,6 +78,12 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   actual model sizes at `/v1/models/status`, and ai-swap could cross-check with it.
 - [ ] **Strata's non-interactive server command**, still unconfirmed (roadmap item 1). Sushi, ds4
   and oMLX are confirmed.
+- [ ] **omp ignores its generated providers on mini-ubuntu.** omp 14.6.4 lists only its own
+  `llama.cpp/gemma-4-26b-a4b`; the `llama-*` and `ai-swap-*` providers that llama-config and
+  ai-swap-clients write to `~/.omp/agent/models.yml` don't appear in `omp --list-models`, so the
+  file's format or location has changed for this omp. pi works with the same providers.
+- [ ] **pi 0.72 on mini-ubuntu** is the old `@mariozechner/pi-coding-agent`; studio runs
+  `@earendil-works/pi-coding-agent` 1.5. Both work with the keyed configs (`!printenv`).
 - [ ] **omp on the Mac:** `ai-swap-clients` skips oh-my-pi because `~/.omp` doesn't exist there.
   Set it up, then rerun `ai-swap-clients --default flint`.
 - [ ] **A Mac config generator** (optional): like `llama-config`, but discovering `~/models/omlx`
