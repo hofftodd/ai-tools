@@ -23,7 +23,7 @@ keys/new-tokens                      # create AI_SWAP_API_KEY and AI_SEARCH_TOKE
 | ↳ same value as `AI_DELEGATE_SEARCH_TOKEN` (`web.search_token`) | ai-delegate → ai-search | studio: `~/.config/ai-delegate/env` | new |
 | `AI_FACTORY_TOKEN` | ai-factory API/UI login | mini-ubuntu2: `~/.config/ai-factory/env` | set |
 | `AI_SWAP_API_KEY` | ai-swap, one key for the whole cluster (also sent to peers) | studio, mini-ubuntu, mini-ubuntu2: `~/.config/ai-swap/env` | new |
-| ↳ same value, sent as a client | ai-factory; ai-delegate; pi/opencode/claude-swap configs from ai-swap-clients | mini-ubuntu2: ai-factory env; studio: ai-delegate env and your shell | new |
+| ↳ same value, sent as a client | ai-factory; ai-delegate; ai-bench; daily-update; pi/opencode/claude-swap configs from ai-swap-clients and llama-config (they refer to `$AI_SWAP_API_KEY`) | mini-ubuntu2: ai-factory env; studio: ai-delegate env and your shell; mini-ubuntu: daily-update `.env` and your shell | new |
 | `DASH_TOKEN` | daily-update dashboard sign-in | mini-ubuntu: `~/dev/daily-update/.env` | set |
 | `LOCATION_TOKEN` | daily-update phone location webhook | mini-ubuntu: `~/dev/daily-update/.env` | set |
 | `ANTHROPIC_API_KEY` | daily-update's `anthropic` provider (the SDK reads `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from the environment, which `core/common.py` loads from `.env`) | mini-ubuntu: `~/dev/daily-update/.env` | not set; config.json uses ai-swap. Create the item only if you switch providers |
@@ -65,7 +65,7 @@ header lines tell `render` what to do (they aren't written to the env file):
 | studio | `ai-swap` | `~/.config/ai-swap/env` | LaunchAgent `com.github.hofftodd.ai-swap` |
 | studio | `ai-delegate` | `~/.config/ai-delegate/env` | none (restart Claude Code) |
 | mini-ubuntu | `ai-swap` | `~/.config/ai-swap/env` | `ai-swap` |
-| mini-ubuntu | `daily-update` | `~/dev/daily-update/.env` | `daily-update` |
+| mini-ubuntu | `daily-update` | `~/dev/daily-update/.env` (includes `AI_SWAP_API_KEY`) | `daily-update` |
 | mini-ubuntu2 | `ai-swap` | `~/.config/ai-swap/env` | `ai-swap` |
 | mini-ubuntu2 | `ai-search` | `~/.config/ai-search/env` | `ai-search` |
 | mini-ubuntu2 | `ai-factory` | `~/.config/ai-factory/env` | `ai-factory` |
@@ -100,15 +100,12 @@ Setting a key turns authentication on, so clients must have it first:
 4. Search: rendering mini-ubuntu2 sets `AI_SEARCH_TOKEN`, which closes ai-search to anything
    without it. ai-factory gets it in the same render; render studio right after for ai-delegate.
 
-Open items for the other repos:
-
-- **ai-delegate** has to read `~/.config/ai-delegate/env` (`AI_SWAP_API_KEY`,
-  `AI_DELEGATE_SEARCH_TOKEN`) or an equivalent: it is started by Claude Code, so it doesn't see
-  your shell's environment when Claude Code is launched from the desktop app. Rename the
-  variables in `templates/studio/ai-delegate.env.tpl` to whatever it ends up reading.
-- **daily-update** talks to mini-ubuntu's ai-swap with `config.json`'s `api_key` (default
-  `"local"`). Once mini-ubuntu's ai-swap has a key, daily-update needs it too, e.g. by reading
-  `AI_SWAP_API_KEY` from `.env`; add that line to its template then.
+Every client can send the key when it's set (and sends nothing when it isn't): ai-factory
+(ai-factory#49), ai-delegate (ai-delegate#6, reads `~/.config/ai-delegate/env`), ai-bench
+(ai-bench#3), daily-update (daily-update#3, `api_key_env`), and the client configs written by
+`ai-swap-clients` and `llama-config`. Merge and deploy those before step 3. daily-update's
+`config.json` is local: add `"api_key_env": "AI_SWAP_API_KEY"` to `providers.local` on
+mini-ubuntu before rendering it.
 
 ## You do
 
@@ -122,8 +119,8 @@ Claude never sees or types the values; you enter them.
 2. **Create the vault** `ai-suite` (in the app, or `op vault create ai-suite`).
 3. **Create a service account** for the two Linux boxes with read access to `ai-suite` only
    (1Password.com → Developer → Service Accounts). On each Linux box save its token:
-   `mkdir -p ~/.config/op && install -m 600 /dev/stdin ~/.config/op/service-account-token`
-   and paste, then Ctrl-D.
+   `install -d -m 700 ~/.config/op && install -m 600 /dev/stdin ~/.config/op/service-account-token`
+   and paste, then Ctrl-D. `op` refuses to run if `~/.config/op` is wider than 700.
    Check with `keys/render --dry-run <machine>`.
 4. **Enter the existing values** as Password items titled exactly `BRAVE_API_KEY`,
    `AI_FACTORY_TOKEN`, `DASH_TOKEN`, `LOCATION_TOKEN` (copy them from the env files listed in the
@@ -131,7 +128,10 @@ Claude never sees or types the values; you enter them.
    set the password in the app. Add `credentials.json` and `data/google/token.json` with
    `op document create <file> --vault ai-suite`.
 5. **Generate the new ones:** `keys/new-tokens` (on studio).
-6. **Shell on studio:** to give pi/opencode/claude-swap the key, add to `~/.zshrc`:
+6. **Shells:** pi, opencode, claude-swap and claude-local read `$AI_SWAP_API_KEY`, so load it in
+   your shell on studio (`~/.zshrc`) and mini-ubuntu (`~/.bashrc`):
    `set -a; [ -r ~/.config/ai-swap/env ] && . ~/.config/ai-swap/env; set +a`
+   Then rerun `ai-swap-clients` (studio) and `llama-config` (mini-ubuntu) once the key is set,
+   so their configs refer to the variable instead of the dummy key.
 7. **Clean up** the retired files listed above.
 8. Follow the rollout order: `keys/render --dry-run <machine>`, then `keys/render <machine>`.
