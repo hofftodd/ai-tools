@@ -73,6 +73,8 @@ better one for latency. ai-delegate's sandbox image builds on ai-factory's `exec
 | Using them | coding agents, ai-factory, the chat UI |
 | Measuring them | ai-bench |
 | Handing work to them from Claude Code | ai-delegate |
+| Code ai-factory and ai-delegate share (sandbox, web fetch and search, ai-swap client with leases) | ai-common |
+| Keys for all of it, kept in 1Password and rendered into each service's env file | `keys/` |
 | Searching the web for them | ai-search (mini-ubuntu2) |
 | Finding and keeping them | hf-watch, sync-models |
 | Keeping the checkout in order | suite |
@@ -181,8 +183,8 @@ plus the ai-factory and ai-search services.
 
 | Role | How many | Needs | Taken on by | Clients find it by |
 |---|---|---|---|---|
-| Model node | any | the memory, and a GPU or Apple silicon; DwarfStar and oMLX are Mac-only | ai-swap config with models (hand-written, or `llama-config` on Linux with a discrete GPU) | `peers:` in every other node's ai-swap config |
-| ai-swap without models | any | – | ai-swap config with no models and a `role:` note | the same `peers:` lists |
+| Model node | any | the memory, and a GPU or Apple silicon; DwarfStar and oMLX are Mac-only | ai-swap config with models (hand-written, or `llama-config` on Linux with a discrete GPU) | one `peers:` entry on any node; the rest learn it from their peers |
+| ai-swap without models | any | – | ai-swap config with no models and a `role:` note | the same: one `peers:` entry |
 | ai-factory host | one | Docker; ideally not a model node, so agents don't compete with models for memory | the `ai-factory` systemd user unit | its dashboard URL (`:8700`) |
 | ai-search | one | the backend's API key | the `ai-search` systemd user unit | `AI_FACTORY_SEARCH_URL`, ai-delegate's config |
 | ai-delegate | any | Docker, or `srt` for the `host` sandbox | running Claude Code there with the MCP server | – (local to Claude Code) |
@@ -196,10 +198,10 @@ Two limits are by design:
   same host as its containers; a second copy would be a separate factory with its own database.
   ai-search keeps the API key, a day's cache and the monthly cap in one place; two copies would
   split the cache and double the spending the cap allows.
-- **Wired by hand, not discovered.** ai-swap peers are listed in each config, so adding a model
-  node means editing every existing one. Clients reach services through fixed names
-  (`mini-ubuntu2.local:8889`, ai-delegate's `endpoint`). Moving a role is a config change on the
-  machines that point at it, not a reinstall.
+- **Services are wired by hand.** ai-swap peers now learn each other (a new node needs one
+  `peers:` entry), and ai-factory imports its nodes from ai-swap, but clients still reach
+  services through fixed names (`mini-ubuntu2.local:8889`, ai-delegate's `endpoint`). Moving a
+  role is a config change on the machines that point at it, not a reinstall.
 
 ## ai-swap: one pool of models
 
@@ -228,6 +230,16 @@ works against local models.
 **When a machine is down.** Connections to a peer time out after 3 s; a failed forward marks the
 peer offline at once, and requests for its models get `503` with `Retry-After`, naming the
 machine, rather than "unknown model". It comes back on the next successful poll.
+
+**Leases.** A client that uses a model for minutes at a time, with pauses between requests
+(an agent step), takes a lease (`POST /api/leases`): while it lasts the model counts as busy, so
+a load that needs its memory waits instead of evicting it. ai-factory takes one per Tester or
+Builder step and planner job, ai-delegate one per job, both through ai-common. Unrenewed leases
+lapse (10 minutes by default).
+
+**API key.** With `AI_SWAP_API_KEY` (or `node.api_key`) set, every API route needs it, peers
+send it to each other, and the UI asks for it once. The cluster shares one key, kept in
+1Password with the suite's other keys (`keys/`).
 
 **Reservations.** A client that needs a machine to itself (an ai-bench run) takes a reservation
 (`POST /api/lock`). Until it's released or lapses (default 5 minutes without renewal), only
@@ -276,7 +288,8 @@ ai-bench's results (`ai-factory/specs/000-orchestrator/spike-notes.md`):
 | Builder | flint | studio (oMLX) |
 | Tester | ThinkingCap-Qwen3.8-27B | mini-ubuntu |
 
-**Avoiding swaps.** An agent step uses its model for minutes, with pauses between requests while
+**Avoiding swaps.** Each step holds an ai-swap lease on its model (see Leases above), so it
+can't be evicted mid-step. Residency still decides the order work starts in. An agent step uses its model for minutes, with pauses between requests while
 its tools run, but ai-swap only protects a model while a request is in flight. Two steps whose
 models don't fit on one machine would swap each other out on almost every turn. So ai-factory reads
 ai-swap's status every few seconds (`ai-factory/src/ai_factory/residency.py`) and holds back work whose
@@ -329,16 +342,19 @@ flowchart LR
 
 ## Where things live
 
-| What | studio | mini-ubuntu |
-|---|---|---|
-| This suite | `~/dev/ai-tools` | `~/dev/ai-tools` |
-| ai-swap config | `~/.config/ai-swap/config.yaml` | `~/.config/ai-swap/config.yaml` |
-| ai-swap service | `~/Library/LaunchAgents/com.github.hofftodd.ai-swap.plist`, log `~/Library/Logs/ai-swap.log` | `~/.config/systemd/user/ai-swap.service`, `journalctl --user -u ai-swap` |
-| Agent configs | `~/.pi/agent/models.json`, `~/.config/opencode/opencode.json`, `~/.local/bin/claude-swap` | same, plus `~/.omp/agent/models.yml`, `claude-local` |
-| Tools on PATH | `~/.local/bin`: ai-swap, ai-swap-clients, sync-models | the same plus llama-config |
-| oMLX settings | `~/.omlx/settings.json`, `~/.omlx/model_settings.json` (MTP per model) | — |
-| ai-factory | — | `~/.config/ai-factory/` (service and env files, not installed) |
-| hf-watch | LaunchAgent `com.thoffman.hf-watch`, state `~/.cache/hf-watch/` | — |
+| What | studio | mini-ubuntu | mini-ubuntu2 |
+|---|---|---|---|
+| This suite | `~/dev/ai-tools` | `~/dev/ai-tools` | `~/dev/ai-tools` |
+| ai-swap config | `~/.config/ai-swap/config.yaml` | `~/.config/ai-swap/config.yaml` | `~/.config/ai-swap/config.yaml` (no models) |
+| ai-swap service | `~/Library/LaunchAgents/com.github.hofftodd.ai-swap.plist`, log `~/Library/Logs/ai-swap.log` | `~/.config/systemd/user/ai-swap.service`, `journalctl --user -u ai-swap` | same as mini-ubuntu |
+| Agent configs | `~/.pi/agent/models.json`, `~/.config/opencode/opencode.json`, `~/.local/bin/claude-swap` | same, plus `~/.omp/agent/models.yml`, `claude-local` | — |
+| Tools on PATH | `~/.local/bin`: ai-swap, ai-swap-clients, sync-models | the same plus llama-config | the same as mini-ubuntu |
+| oMLX settings | `~/.omlx/settings.json`, `~/.omlx/model_settings.json` (MTP per model) | — | — |
+| ai-factory | — | — | systemd user unit `ai-factory`, `~/.config/ai-factory/env`, `:8700` |
+| ai-search | — | — | systemd user unit `ai-search`, `~/.config/ai-search/env`, `:8889` |
+| ai-delegate | `~/.config/ai-delegate/config.yaml` and `env` (keys) | — | — |
+| Keys | rendered from 1Password by `keys/render studio` | `keys/render mini-ubuntu` | `keys/render mini-ubuntu2` |
+| hf-watch | LaunchAgent `com.thoffman.hf-watch`, state `~/.cache/hf-watch/` | — | — |
 
 ## Ports
 

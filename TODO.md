@@ -1,6 +1,6 @@
 # TODO
 
-Open work across the suite, as of 2026-11-09 (Foreman renamed to ai-factory, which runs on mini-ubuntu2). Benchmarking work is tracked
+Open work across the suite, as of 2026-11-15 (suite fixes deployed: ai-swap leases, API key, model facts and learned peers; ai-common shared by ai-factory and ai-delegate; keys in 1Password, not yet switched on). Benchmarking work is tracked
 separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 
 ## Needs you (a decision, sudo or the router)
@@ -10,58 +10,35 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
   blocked for me, so run:
   `cd ~/models-archived && rm -rf ds4 deepseek-v4-flash flint qwen3.8-27b qwen3.8-flash-next omlx sushi`
 
+- [ ] **Switch the keys on** (`keys/README.md` has the steps): install the 1Password CLI (`op`)
+  on studio, mini-ubuntu and mini-ubuntu2; create the `ai-suite` vault and a service account for
+  the two Linux boxes; enter the existing values (Brave, daily-update's tokens and OAuth file).
+  Then `keys/new-tokens` and `keys/render <machine>` on all three, restarting the three ai-swaps
+  together so they share the key. Every piece of the suite already reads the keys when set.
+- [ ] **Delete the retired `FOREMAN_TOKEN`** env file on mini-ubuntu (`~/.config/foreman/foreman.env`).
+
 ## ai-factory on the ai-swap cluster
 
-- [ ] **Start ai-factory and add nodes**, one per model, all on the Mac's ai-swap endpoint
-  (`http://studio.local:8080/v1`), OpenAI-compatible, no key, price 0:
-
-  | node | context window | capacity | model id |
-  |---|---|---|---|
-  | `deepseek` | 131072 | 2 | `deepseek-v4-flash` |
-  | `flint` | 131072 | 4 | `flint` |
-  | `thinkingcap` | 131072 | 1 | `thinkingcap-qwen3.8-27b` |
-
-  Bindings: Project Planner, Task Planner and Escalation → deepseek; Builder → flint;
-  Tester → thinkingcap.
-- [ ] **A real project end to end** after PR #5: the Environment Agent building the toolchain,
-  the new pipeline rules, and (for an existing repo) the "How tests run here" note.
+- [ ] **Re-create the nodes from ai-swap** with the Nodes page's Import button (ai-factory#48):
+  one node per model with pinned ids (`flint@studio`, `deepseek-v4-flash@studio`,
+  `thinkingcap-qwen3.8-27b@mini-ubuntu`) so residency and placement agree. Bindings: Project
+  Planner, Task Planner and Escalation → deepseek; Builder → flint; Tester → thinkingcap.
+- [ ] **future-lab end to end, unattended** (next): nodes imported as above,
+  `max_parallel_tasks` 2. Log every point where a person had to step in; those become the next
+  items here. Covers the Environment Agent building the toolchain, the pipeline rules, restart
+  recovery and leases in real use.
 - [ ] **A real multi-project run** to watch the swap avoidance (`ai-factory/src/ai_factory/residency.py`)
   outside the tests: wait events in the activity feed, loaded-first ordering, no ping-pong swaps,
   and waiting while ai-bench has a machine reserved.
-- [ ] **Per-model health checks.** ai-factory's node check only asks whether `/v1/models` answers. On
-  ai-swap nodes it should read the model's own state, so `failed` is caught and `stopped` (merely
-  unloaded) isn't treated as down.
-- [ ] **Import nodes from ai-swap** (idea): a button on the Nodes page that creates one node per
-  ai-swap model with its context length, instead of entering them by hand.
-- [ ] **Tasks cut off by a restart wait for a manual Retry.** `orchestrator/main.py` `recover()`
-  marks running tasks `failed` ("orchestrator restarted during run; retry to continue") but never
-  calls `escalation.after_failure`, so nothing requeues them; the README says they are "retried by
-  the escalation ladder". Seen on future-lab's T1 after deploying ai-factory#16. Either requeue
-  them (an interrupted attempt shouldn't count as a failure) or fix the README.
-- [ ] **`doctor` and image builds miss a Docker permission problem.** `ai-factory doctor` checks
-  Docker as whoever runs it, not as the service, so it passed while the systemd service (started
-  before the user joined the `docker` group) couldn't reach the socket. And a build that fails
-  with "permission denied" on the Docker socket is sent back to the Environment Agent as if its
-  Dockerfile were wrong; it should go straight to the user.
-- [ ] **Run a project's independent tasks in parallel.** Today each project runs one task at a
-  time (`orchestrator/main.py` `pick_ready`; an M1 simplification, `specs/000-orchestrator/plan.md`
-  "One active task per project"). On this cluster the Builder (flint, Mac) and Tester
-  (ThinkingCap, R9700) are on different machines, so serial tasks leave one idle while the other
-  works; overlapping two tasks would keep both busy without extra swaps. Do it after future-lab's
-  serial run (a baseline to compare, and no restart with tasks in flight). What it takes:
-  1. *Scheduling:* up to N active tasks per project (setting, default 1), only tasks whose deps
-     are done; SETUP runs alone first, DOCS last.
-  2. *Merge queue:* merges one at a time; after A merges, B syncs with the milestone branch and
-     the full suite runs again before B merges. A conflict sends B back to its Builder with the
-     conflict.
-  3. *Replanning:* the after-task reviews queue per project, and a review may change or remove
-     only queued tasks, never running ones.
-  4. *Coverage and diffs* are measured from a task's base commit; keep that right when the branch
-     moves under a running task.
-  5. *Placement:* the swap avoidance (`residency.py`) should prefer overlapping steps that land on
-     different machines over two steps queueing for one model.
-  Tests should cover the merge queue (two green tasks that break together, a conflict) and the
-  replanning races. Use future-lab's next phase as the first real trial.
+- [ ] **The dashboard token shows up in access logs.** The dashboard's event stream passes
+  `AI_FACTORY_TOKEN` as `?token=` in the URL, so uvicorn's access log on mini-ubuntu2 records it in
+  `journalctl --user -u ai-factory`. Send it in a header or cookie instead, or drop the query
+  string from the access log. Rotate the token once fixed (it moves to 1Password with the rest).
+- Done 2026-11-15: restart recovery requeues interrupted tasks, per-model health checks, Docker
+  permission problems reported to the user, residency with pinned ids, placement spreads
+  parallel steps across machines, node import from ai-swap (ai-factory#48); ai-common sandbox
+  and web research, a lease per step, the ai-swap key everywhere (ai-factory#49). Parallel tasks
+  already existed (`max_parallel_tasks`, ai-factory 1b13115).
 
 ## ai-delegate
 
@@ -73,8 +50,9 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 - [ ] **Run `routes --write` after new ai-bench results**; it lists the models it couldn't match.
 - [ ] **Watch `ai-delegate stats`** during the trial: tokens saved net of redone work, per tool
   and model. The native side is an estimate; compare it with real session usage when possible.
-- [ ] Web research for local models (port ai-factory's `research.py`): search through
-  `ai-search` on mini-ubuntu2 (`http://mini-ubuntu2.local:8889`, Brave behind it).
+- Done 2026-11-15: web research writes a partial report at its limits, warns when another
+  variant of the requested model is loaded, and "typically" counts every run by depth
+  (ai-delegate#5); ai-common, a lease per job, and the ai-swap and ai-search keys (ai-delegate#6).
 - [ ] Idea: a `sandbox-exec` (Seatbelt) level on macOS between `docker` and `local`, so jobs
   can use the Mac's toolchains with writes limited to the clone (DESIGN.md, Delegation safety).
 
@@ -86,14 +64,9 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 
 ## ai-swap
 
-- [ ] **Smarter placement is on main, not deployed** (2026-11-13): a model on
-  several machines is served where it's loaded, else where it fits in free memory, before
-  local-first; reserved machines are skipped. Pin ai-factory's node ids first (below), then
-  `suite update` on both machines (it rebuilds and restarts ai-swap).
-- [ ] **ai-factory's residency vs placement:** `residency.py` maps the bare id `flint` to the
-  Mac, but with placement a bare `flint` can now be served by mini-ubuntu's copy when only that
-  one is loaded. ai-factory nodes should use pinned ids (`flint@studio`) wherever a model is on
-  both machines (flint, qwen3.8-27b), or residency should read the placement outcome.
+- Done 2026-11-15 (ai-swap#4, deployed on all three): leases (`/api/leases`), `node.api_key` /
+  `AI_SWAP_API_KEY`, parameters and quantization from model files on the card, peers learned
+  from peers. Placement is deployed; ai-factory's residency maps pinned ids (ai-factory#48).
 
 - [ ] **Event stream** (idea): `GET /api/events` (server-sent events) for model and reservation
   changes, to replace the UI's 3 s polling, the peers' 10 s polling and ai-factory's residency reads.
