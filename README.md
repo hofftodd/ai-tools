@@ -17,6 +17,7 @@ orchestrating agent work with ai-factory, and benchmarking the models. How they 
 | [`ai-search/`](ai-search/) | Web search for the local models: a SearXNG-compatible endpoint with Brave Search (or SearXNG) behind it | mini-ubuntu2 |
 | [`hf-watch/`](hf-watch/) | Notifies you when new models of interest appear on Hugging Face | Mac |
 | [`sync-models/`](sync-models/) | Backs model files up to the NAS (two-way on the Linux box, one-way from the Mac) | both |
+| [`keys/`](keys/) | Inventory of every API key (names only) and templates that render each machine's env files from the `ai-suite` 1Password vault | all |
 | [`suite`](suite) | Clones, updates and checks the whole suite on a machine | both |
 
 `ai-swap`, `ai-factory`, `ai-bench` and `ai-delegate` are separate GitHub repos cloned inside this folder. They're

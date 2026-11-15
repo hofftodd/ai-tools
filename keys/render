@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# render: fill one machine's env files from 1Password and restart what changed.
+#
+#   keys/render [--dry-run] [--force] <machine>     machine: studio, mini-ubuntu, mini-ubuntu2
+#
+# For each keys/templates/<machine>/*.env.tpl:
+#   - `op inject` it into a temporary file (mode 600). The template's first lines say where it goes:
+#       # target: ~/path/to/env
+#       # restart: systemd <user unit> | launchd <label> | none
+#   - if the result differs from the target: back the target up (<target>.bak-<timestamp>, mode 600),
+#     install the new file with mode 600, and restart the service.
+#   - systemd: if the unit doesn't load the target yet, add a drop-in
+#     (~/.config/systemd/user/<unit>.service.d/keys.conf, EnvironmentFile=-<target>) first.
+#   - launchd: launchd has no env files, so the variables are also copied into the LaunchAgent's
+#     EnvironmentVariables (the plist is made mode 600), then the agent is reloaded.
+#
+# --dry-run prints, per file, which variable NAMES would be added, removed or changed, and which
+# services would restart. No values are printed, ever. --force renders even if this host's name
+# isn't <machine>.
+#
+# Needs `op` signed in: the desktop app integration on the Mac, a service account on Linux
+# (OP_SERVICE_ACCOUNT_TOKEN, or the token in ~/.config/op/service-account-token, mode 600).
+set -euo pipefail
+umask 077
+
+usage() { sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+dry=0 force=0 machine=
+for a in "$@"; do
+  case $a in
+    --dry-run|-n) dry=1 ;;
+    --force) force=1 ;;
+    -h|--help) usage ;;
+    -*) echo "render: unknown option $a" >&2; usage ;;
+    *) [[ -z $machine ]] || usage; machine=$a ;;
+  esac
+done
+[[ -n $machine ]] || usage
+
+here=$(cd "$(dirname "$0")" && pwd)
+tpldir=$here/templates/$machine
+[[ -d $tpldir ]] || { echo "render: no templates for '$machine' (have: $(ls "$here/templates" | tr '\n' ' '))" >&2; exit 2; }
+
+host=$(hostname -s)
+if [[ $host != "$machine" && $force -eq 0 ]]; then
+  echo "render: this is '$host', not '$machine' (use --force if that's intended)" >&2; exit 2
+fi
+
+command -v op >/dev/null || { echo "render: the 1Password CLI (op) isn't installed" >&2; exit 1; }
+if [[ -z ${OP_SERVICE_ACCOUNT_TOKEN:-} && -r ~/.config/op/service-account-token ]]; then
+  OP_SERVICE_ACCOUNT_TOKEN=$(<~/.config/op/service-account-token)
+  export OP_SERVICE_ACCOUNT_TOKEN
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# header <template> <key>: the value of a "# key: value" line at the top of a template.
+header() { sed -n "s/^# $2: *//p" "$1" | head -n1; }
+
+sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+
+# fingerprint <envfile>: "NAME sha256-of-value" per assignment, so changes can be listed by name.
+fingerprint() {
+  [[ -f $1 ]] || return 0
+  local line name value
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    name=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
+    printf '%s %s\n' "$name" "$(printf '%s' "$value" | sha256 | cut -c1-16)"
+  done <"$1" | sort
+}
+
+# changes <old> <new>: "+NAME", "-NAME", "~NAME" lines.
+changes() {
+  join -a1 -a2 -e - -o '0,1.2,2.2' <(fingerprint "$1") <(fingerprint "$2") |
+    while read -r name old new; do
+      if [[ $old == - ]]; then echo "+$name"
+      elif [[ $new == - ]]; then echo "-$name"
+      elif [[ $old != "$new" ]]; then echo "~$name"
+      fi
+    done
+}
+
+# ensure_dropin <unit> <target>: make the systemd user unit read <target>. Echoes 1 if it added one.
+ensure_dropin() {
+  local unit=$1 target=$2 rel dir
+  rel=${target/#$HOME/%h}
+  if systemctl --user cat "$unit" 2>/dev/null | grep -qxF -e "EnvironmentFile=$target" \
+      -e "EnvironmentFile=-$target" -e "EnvironmentFile=$rel" -e "EnvironmentFile=-$rel"; then
+    return 0
+  fi
+  echo 1
+  [[ $dry -eq 1 ]] && return 0
+  dir=~/.config/systemd/user/$unit.service.d
+  mkdir -p "$dir"
+  printf '[Service]\nEnvironmentFile=-%s\n' "$rel" >"$dir/keys.conf"
+  chmod 644 "$dir/keys.conf"
+}
+
+# launchd_env <label> <envfile>: copy the env file's variables into the LaunchAgent plist.
+launchd_env() {
+  local plist=~/Library/LaunchAgents/$1.plist
+  [[ -f $plist ]] || { echo "render: $plist not found" >&2; return 1; }
+  /usr/bin/python3 - "$plist" "$2" <<'PY'
+import plistlib, re, sys
+plist, envfile = sys.argv[1], sys.argv[2]
+with open(plist, "rb") as f:
+    d = plistlib.load(f)
+env = d.setdefault("EnvironmentVariables", {})
+for line in open(envfile):
+    m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.rstrip("\n"))
+    if m:
+        env[m.group(1)] = m.group(2)
+with open(plist, "wb") as f:
+    plistlib.dump(d, f)
+PY
+  chmod 600 "$plist"
+}
+
+restart() {
+  local kind=$1 name=$2
+  case $kind in
+    systemd)
+      systemctl --user daemon-reload
+      systemctl --user restart "$name.service"
+      echo "  restarted $name.service" ;;
+    launchd)
+      local plist=~/Library/LaunchAgents/$name.plist
+      launchctl bootout "gui/$(id -u)/$name" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      echo "  reloaded $name" ;;
+    none) echo "  no service to restart" ;;
+  esac
+}
+
+status=0
+for tpl in "$tpldir"/*.env.tpl; do
+  [[ -e $tpl ]] || continue
+  name=$(basename "$tpl" .env.tpl)
+  target=$(header "$tpl" target); target=${target/#\~/$HOME}
+  read -r kind svc <<<"$(header "$tpl" restart)"
+  kind=${kind:-none}
+  if [[ -z $target || ! $kind =~ ^(systemd|launchd|none)$ ]]; then
+    echo "render: $tpl needs '# target:' and '# restart:' header lines" >&2; status=1; continue
+  fi
+
+  out=$work/$name.env
+  if ! grep -vE '^# (target|restart):' "$tpl" | op inject -o "$out" >/dev/null; then
+    echo "render: op inject failed for $name (missing item, or op not signed in?)" >&2; status=1; continue
+  fi
+  chmod 600 "$out"
+
+  echo "$name -> $target"
+  diffs=$(changes "$target" "$out")
+  dropin=
+  [[ $kind == systemd ]] && dropin=$(ensure_dropin "$svc" "$target")
+
+  if [[ -f $target ]] && cmp -s "$target" "$out" && [[ -z $dropin ]]; then
+    echo "  unchanged"; continue
+  fi
+  if [[ -n $diffs ]]; then
+    sed 's/^/  /' <<<"$diffs"
+  elif [[ -z $dropin ]]; then
+    echo "  (comments or formatting only)"
+  fi
+  [[ -n $dropin ]] && echo "  $svc.service: add drop-in EnvironmentFile=-${target/#$HOME/%h}"
+
+  if [[ $dry -eq 1 ]]; then
+    [[ $kind == none ]] || echo "  would restart $kind $svc"
+    continue
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  if [[ -f $target ]]; then
+    bak=$target.bak-$(date +%Y%m%d-%H%M%S)
+    cp -p "$target" "$bak"; chmod 600 "$bak"
+    echo "  backup: $bak"
+  fi
+  install -m 600 "$out" "$target"
+  [[ $kind == launchd ]] && launchd_env "$svc" "$target"
+  restart "$kind" "$svc"
+done
+exit $status
