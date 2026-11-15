@@ -23,7 +23,7 @@ keys/new-tokens                      # create AI_SWAP_API_KEY and AI_SEARCH_TOKE
 | ↳ same value as `AI_DELEGATE_SEARCH_TOKEN` (`web.search_token`) | ai-delegate → ai-search | studio: `~/.config/ai-delegate/env` | new |
 | `AI_FACTORY_TOKEN` | ai-factory API/UI login | mini-ubuntu2: `~/.config/ai-factory/env` | set |
 | `AI_SWAP_API_KEY` | ai-swap, one key for the whole cluster (also sent to peers) | studio, mini-ubuntu, mini-ubuntu2: `~/.config/ai-swap/env` | new |
-| ↳ same value, sent as a client | ai-factory; ai-delegate; ai-bench; daily-update; pi/opencode/claude-swap configs from ai-swap-clients and llama-config (they refer to `$AI_SWAP_API_KEY`) | mini-ubuntu2: ai-factory env; studio: ai-delegate env and your shell; mini-ubuntu: daily-update `.env` and your shell | new |
+| ↳ same value, sent as a client | ai-factory; ai-delegate; ai-bench; daily-update; pi/opencode/claude-swap configs from ai-swap-clients and llama-config (they read `$AI_SWAP_API_KEY` at run time: `!printenv AI_SWAP_API_KEY` for pi and omp, `{env:…}` for opencode, `${…}` in the Claude wrappers) | mini-ubuntu2: ai-factory env; studio: ai-delegate env and your shell; mini-ubuntu: daily-update `.env` and your shell | new |
 | `DASH_TOKEN` | daily-update dashboard sign-in | mini-ubuntu: `~/dev/daily-update/.env` | set |
 | `LOCATION_TOKEN` | daily-update phone location webhook | mini-ubuntu: `~/dev/daily-update/.env` | set |
 | `ANTHROPIC_API_KEY` | daily-update's `anthropic` provider (the SDK reads `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from the environment, which `core/common.py` loads from `.env`) | mini-ubuntu: `~/dev/daily-update/.env` | not set; config.json uses ai-swap. Create the item only if you switch providers |

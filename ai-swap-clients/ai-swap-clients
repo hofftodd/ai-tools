@@ -69,7 +69,8 @@ def api_key() -> str:
 # What each client config says for the key: the dummy without one, else a reference to
 # $AI_SWAP_API_KEY in that client's own syntax, so the key itself never lands in a file.
 KEYED = bool(api_key())
-PI_KEY = "$AI_SWAP_API_KEY" if KEYED else "no-key-required"
+# pi 1.x expands $VAR, pi 0.x takes a bare variable name; both run a "!command".
+PI_KEY = "!printenv AI_SWAP_API_KEY" if KEYED else "no-key-required"
 OPENCODE_KEY = "{env:AI_SWAP_API_KEY}" if KEYED else "no-key-required"
 
 

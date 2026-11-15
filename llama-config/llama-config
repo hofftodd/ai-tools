@@ -550,7 +550,8 @@ done
 # If the cluster has a key ($AI_SWAP_API_KEY, or the env file keys/render writes), the health
 # check sends it and the client configs refer to $AI_SWAP_API_KEY instead of a dummy key.
 SWAP_KEY="${AI_SWAP_API_KEY:-$(sed -n 's/^AI_SWAP_API_KEY=//p' "$HOME/.config/ai-swap/env" 2>/dev/null | tr -d "\"'")}"
-if [[ -n "$SWAP_KEY" ]]; then PI_KEY='$AI_SWAP_API_KEY'; OPENCODE_KEY='{env:AI_SWAP_API_KEY}'; else PI_KEY=no-key-required; OPENCODE_KEY=no-key-required; fi
+# pi 1.x expands $VAR, pi 0.x takes a bare variable name; both run a "!command".
+if [[ -n "$SWAP_KEY" ]]; then PI_KEY='!printenv AI_SWAP_API_KEY'; OPENCODE_KEY='{env:AI_SWAP_API_KEY}'; else PI_KEY=no-key-required; OPENCODE_KEY=no-key-required; fi
 AUTH_ARGS=(); [[ -n "$SWAP_KEY" ]] && AUTH_ARGS=(-H "Authorization: Bearer $SWAP_KEY")
 
 # ---- Client provider builders (one provider per model, shared endpoint) ------
