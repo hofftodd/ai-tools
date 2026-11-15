@@ -14,13 +14,14 @@ orchestrating agent work with ai-factory, and benchmarking the models. How they 
 | [`ai-factory/`](https://github.com/hofftodd/ai-factory) | Orchestrates coding agents (planners, tester, builder) on local models, in Docker sandboxes (formerly Foreman) | mini-ubuntu2 (`:8700`) |
 | [`ai-bench/`](https://github.com/hofftodd/ai-bench) | Benchmarks models (speed, LiveCodeBench, agentic terminal tasks) and writes the analyses | both |
 | [`ai-delegate/`](https://github.com/hofftodd/ai-delegate) | MCP server that lets Claude Code hand work to the local models: questions, reviews, and coding jobs in a sandbox that come back as a diff | where Claude Code runs |
+| [`ai-common/`](https://github.com/hofftodd/ai-common) | Python package ai-factory and ai-delegate share: Docker sandboxing and the isolated network's relay, the guarded web fetch and search client, an ai-swap client with model leases | wherever those run |
 | [`ai-search/`](ai-search/) | Web search for the local models: a SearXNG-compatible endpoint with Brave Search (or SearXNG) behind it | mini-ubuntu2 |
 | [`hf-watch/`](hf-watch/) | Notifies you when new models of interest appear on Hugging Face | Mac |
 | [`sync-models/`](sync-models/) | Backs model files up to the NAS (two-way on the Linux box, one-way from the Mac) | both |
 | [`keys/`](keys/) | Inventory of every API key (names only) and templates that render each machine's env files from the `ai-suite` 1Password vault | all |
 | [`suite`](suite) | Clones, updates and checks the whole suite on a machine | both |
 
-`ai-swap`, `ai-factory`, `ai-bench` and `ai-delegate` are separate GitHub repos cloned inside this folder. They're
+`ai-swap`, `ai-factory`, `ai-bench`, `ai-delegate` and `ai-common` are separate GitHub repos cloned inside this folder. They're
 hidden from this repo's git through `.git/info/exclude` (local only, never committed), so each
 keeps its own history, branches and pull requests. Everything else is part of this repo.
 
@@ -29,7 +30,7 @@ keeps its own history, branches and pull requests. Everything else is part of th
 ```bash
 git clone git@github.com:hofftodd/ai-tools.git ~/dev/ai-tools
 cd ~/dev/ai-tools
-./suite clone      # clone ai-swap, ai-factory, ai-bench and ai-delegate into place
+./suite clone      # clone ai-swap, ai-factory, ai-bench, ai-delegate and ai-common into place
 ./suite update     # build ai-swap, set up the Python environments, link tools into ~/.local/bin
 ```
 

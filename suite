@@ -2,7 +2,8 @@
 # suite: manage the ai-tools suite on this machine.
 #
 # ai-tools holds small tools directly (hf-watch, llama-config, sync-models, ai-swap-clients) and
-# four projects cloned inside it as their own git repos (ai-swap, ai-factory, ai-bench, ai-delegate), hidden from
+# five projects cloned inside it as their own git repos (ai-swap, ai-factory, ai-bench, ai-delegate, and
+# ai-common, the Python package ai-factory and ai-delegate share), hidden from
 # ai-tools' git through .git/info/exclude. This script keeps that layout reproducible.
 #
 #   suite [status]   branch, ahead/behind and local changes of ai-tools and each repo
@@ -22,6 +23,7 @@ REPOS=(
   "ai-factory|git@github.com:hofftodd/ai-factory.git"
   "ai-bench|git@github.com:hofftodd/ai-bench.git"
   "ai-delegate|git@github.com:hofftodd/ai-delegate.git"
+  "ai-common|git@github.com:hofftodd/ai-common.git"
 )
 # Go and uv live outside the default PATH on the Linux box.
 export PATH="$BIN:/usr/local/go/bin:/opt/homebrew/bin:$PATH"
@@ -130,7 +132,7 @@ cmd_update() {
     warn "  ai-swap: go not found, not built"
   fi
   local p
-  for p in ai-factory ai-bench ai-delegate; do
+  for p in ai-common ai-factory ai-bench ai-delegate; do
     if [[ -d "$HERE/$p/.git" ]] && command -v uv >/dev/null; then
       (cd "$HERE/$p" && uv sync -q) && echo "  $p: Python environment in sync"
     fi
@@ -171,6 +173,6 @@ case "${1:-status}" in
   pull)    cmd_pull ;;
   update)  cmd_update ;;
   links)   cmd_links ;;
-  -h|--help|help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (try: suite help)" ;;
 esac
