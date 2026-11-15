@@ -33,13 +33,47 @@ flowchart LR
     mini -. sync-models .-> nas
 ```
 
+The orchestrators also use services that ai-swap knows nothing about: web search and the
+sandboxes their agents run in. ai-swap routes model requests only; each orchestrator calls
+ai-search directly and runs its own containers.
+
+```mermaid
+graph TD
+    subgraph Orchestration
+        CC[Claude Code] -->|MCP| AIDelegate[ai-delegate]
+        AIFactory[ai-factory]
+        Bench[ai-bench]
+    end
+    subgraph Pool ["Model pool (ai-swap on each machine, peers)"]
+        SwapS["ai-swap @ studio<br/>DwarfStar · oMLX · llama.cpp"]
+        SwapM["ai-swap @ mini-ubuntu<br/>llama.cpp Vulkan"]
+        SwapS <-->|peers| SwapM
+    end
+    subgraph Services ["Shared services"]
+        Search["ai-search<br/>mini-ubuntu2 :8889"]
+        DockerF["Docker sandboxes<br/>mini-ubuntu2"]
+        DockerD["Docker / srt sandbox<br/>local to Claude Code"]
+    end
+    AIFactory -->|models| SwapS
+    AIDelegate -->|models| SwapS
+    Bench -->|reserves| SwapS
+    AIFactory --> Search
+    AIDelegate --> Search
+    AIFactory --> DockerF
+    AIDelegate --> DockerD
+```
+
+Either machine is a front door; the orchestrators are drawn against studio because it's the
+better one for latency. ai-delegate's sandbox image builds on ai-factory's `executor-base`.
+
 | Layer | Tools |
 |---|---|
 | Serving models | ai-swap (one per machine) and the engines it starts |
 | Pointing clients at them | ai-swap-clients (both machines), llama-config (Linux box) |
 | Using them | coding agents, ai-factory, the chat UI |
 | Measuring them | ai-bench |
-| Handing work to them from Claude Code | ai-delegate (planned) |
+| Handing work to them from Claude Code | ai-delegate |
+| Searching the web for them | ai-search (mini-ubuntu2) |
 | Finding and keeping them | hf-watch, sync-models |
 | Keeping the checkout in order | suite |
 
@@ -213,6 +247,7 @@ flowchart LR
 | 8000, 8010, 12345, 5896–5897 | engines started directly by ai-bench on the Mac (DwarfStar, oMLX, sushi, llama.cpp) |
 | 8090 | Strata, started by ai-bench on the Linux box |
 | 8700, 8701 | ai-factory's dashboard and its model gateway (on its host) |
+| 8889 | ai-search (mini-ubuntu2) |
 
 ## Design choices
 
