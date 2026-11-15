@@ -98,6 +98,36 @@ router's LAN, with backups on a TrueNAS box (`truenas.local`). Two network detai
   latency-sensitive work; requests forwarded through it to mini-ubuntu add about 0.2 s to the
   first token.
 
+## Roles
+
+Every machine installs the same suite (`suite clone`, `suite update`); the only per-OS
+differences are PATH fix-ups and linking `llama-config` on Linux. What a machine *does* comes
+from its config and the services enabled on it, so any machine can take any role its hardware
+allows. mini-ubuntu2 is the example: it runs ai-swap with no models (`role: ai-factory host`),
+plus the ai-factory and ai-search services.
+
+| Role | How many | Needs | Taken on by | Clients find it by |
+|---|---|---|---|---|
+| Model node | any | the memory, and a GPU or Apple silicon; DwarfStar and oMLX are Mac-only | ai-swap config with models (hand-written, or `llama-config` on Linux with a discrete GPU) | `peers:` in every other node's ai-swap config |
+| ai-swap without models | any | – | ai-swap config with no models and a `role:` note | the same `peers:` lists |
+| ai-factory host | one | Docker; ideally not a model node, so agents don't compete with models for memory | the `ai-factory` systemd user unit | its dashboard URL (`:8700`) |
+| ai-search | one | the backend's API key | the `ai-search` systemd user unit | `AI_FACTORY_SEARCH_URL`, ai-delegate's config |
+| ai-delegate | any | Docker, or `srt` for the `host` sandbox | running Claude Code there with the MCP server | – (local to Claude Code) |
+| Benchmarking | per model node | the node it measures | an ai-bench config with `reserve:` | – |
+| hf-watch | one | macOS (LaunchAgent, notifications) | its LaunchAgent | – |
+| Model backups | per model node | the NAS mounted | `sync-models` | – |
+
+Two limits are by design:
+
+- **Single-instance roles.** ai-factory needs its bind-mounted clones and model gateway on the
+  same host as its containers; a second copy would be a separate factory with its own database.
+  ai-search keeps the API key, a day's cache and the monthly cap in one place; two copies would
+  split the cache and double the spending the cap allows.
+- **Wired by hand, not discovered.** ai-swap peers are listed in each config, so adding a model
+  node means editing every existing one. Clients reach services through fixed names
+  (`mini-ubuntu2.local:8889`, ai-delegate's `endpoint`). Moving a role is a config change on the
+  machines that point at it, not a reinstall.
+
 ## ai-swap: one pool of models
 
 ai-swap is a Go program, one per machine, in front of the inference engines
