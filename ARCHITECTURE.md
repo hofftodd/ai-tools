@@ -98,6 +98,79 @@ router's LAN, with backups on a TrueNAS box (`truenas.local`). Two network detai
   latency-sensitive work; requests forwarded through it to mini-ubuntu add about 0.2 s to the
   first token.
 
+**Away from home.** All three machines are also on a Tailscale tailnet, along with a laptop and
+a phone. Nothing in the suite depends on it at home; it is how the pool is reached from
+elsewhere, instead of opening ports.
+
+```mermaid
+graph TD
+    subgraph LAN ["Home LAN (mDNS .local names)"]
+        subgraph studio ["studio (Mac Studio, 256 GB)"]
+            S_node["Model node<br/>ai-swap + DwarfStar · oMLX · llama.cpp"]
+            S_cc["Claude Code + ai-delegate"]
+            S_sbx["Docker / srt sandbox"]
+            S_bench["Benchmarking<br/>ai-bench"]
+            S_hf["hf-watch ①"]
+            S_sync["Model backups<br/>sync-models"]
+        end
+        subgraph mini ["mini-ubuntu (R9700, 32 GB)"]
+            M_node["Model node<br/>ai-swap + llama.cpp Vulkan"]
+            M_bench["Benchmarking<br/>ai-bench"]
+            M_sync["Model backups<br/>sync-models"]
+        end
+        subgraph mini2 ["mini-ubuntu2 (no model GPU)"]
+            U_swap["ai-swap without models"]
+            U_factory["ai-factory host ①"]
+            U_sbx["Docker sandboxes"]
+            U_search["ai-search ①"]
+        end
+        NAS[(truenas)]
+    end
+
+    subgraph Away ["Away from home"]
+        A_cc["Laptop<br/>Claude Code + ai-delegate"]
+        A_sbx["Docker / srt sandbox"]
+        Phone["Phone<br/>browser"]
+    end
+
+    TS{{"Tailscale tailnet<br/>MagicDNS *.ts.net"}}
+
+    S_node <-->|peers, LAN| M_node
+    S_node <-->|peers, LAN| U_swap
+    M_node <-->|peers, LAN| U_swap
+
+    S_cc -->|models| S_node
+    S_cc --> S_sbx
+    S_cc -->|search| U_search
+    U_factory -->|models| S_node
+    U_factory --> U_sbx
+    U_factory -->|search| U_search
+    S_bench -->|reserves| S_node
+    M_bench -->|reserves| M_node
+    S_sync -.-> NAS
+    M_sync -.-> NAS
+
+    A_cc --> A_sbx
+    A_cc -.->|"endpoint list:<br/>.local first, then .ts.net"| TS
+    Phone -.->|"chat UI, ai-factory dashboard"| TS
+    TS -.-> S_node
+    TS -.-> U_search
+    TS -.-> U_factory
+```
+
+Boxes are the roles each machine holds (see [Roles](#roles)); ① marks a role that runs on one
+machine only. The tailnet is drawn as a hub for readability; devices connect to each other
+directly.
+
+- **Only ai-delegate falls back to Tailscale.** Its ai-swap `endpoint` and its search URL are
+  lists tried in order, so a laptop lists the `.local` name first and the `*.ts.net` name next.
+- **ai-swap peers stay on the LAN.** `peers:` use `.local` names. A laptop that reaches studio
+  over Tailscale still gets mini-ubuntu's models, because studio forwards those requests.
+- **The web pages need no setup:** the ai-swap UI (`:8080`) and the ai-factory dashboard
+  (`:8700`) open from any tailnet device.
+- **ai-factory, ai-bench and sync-models are LAN-only.** They run at home and use `.local`
+  names; the NAS is backed up to over the LAN.
+
 ## Roles
 
 Every machine installs the same suite (`suite clone`, `suite update`); the only per-OS
