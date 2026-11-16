@@ -22,10 +22,10 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
 
 ## ai-factory on the ai-swap cluster
 
-- [ ] **Re-create the nodes from ai-swap** with the Nodes page's Import button (ai-factory#48):
-  one node per model with pinned ids (`flint@studio`, `deepseek-v4-flash@studio`,
-  `thinkingcap-qwen3.8-27b@mini-ubuntu`) so residency and placement agree. Bindings: Project
-  Planner, Task Planner and Escalation → deepseek; Builder → flint; Tester → thinkingcap.
+- Done 2026-11-15: ai-factory's nodes come from ai-swap's import, one per model, pinned to its
+  machine (`flint@studio`, …); the three old hand-made nodes are deleted. Import falls back to a
+  32K context when ai-swap's config sets none (studio's MLX models), so `flint@studio` was set to
+  131072 by hand; reading the context from the model files would avoid that.
 - [ ] **future-lab end to end, unattended** (next): nodes imported as above,
   `max_parallel_tasks` 2. Log every point where a person had to step in; those become the next
   items here. Covers the Environment Agent building the toolchain, the pipeline rules, restart
