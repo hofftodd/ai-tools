@@ -63,7 +63,7 @@ separately in [`ai-bench/TODO.md`](ai-bench/TODO.md).
     Approving `already_built` and coverage gates let it through; consider an integration check
     per requirement area before marking such tasks done. (Still open: #54's acceptance check
     covers only acceptance-only tasks.)
-  - [ ] **future-lab#3 review findings** (before merging it): users and sessions get random
+  - [x] (fixed on future-lab#3, 25cb882; tests and acceptance pass) **future-lab#3 review findings**: users and sessions get random
     24-bit ids (`backend/auth.py` `_fresh_row_id`), so sign-in starts failing with an
     IntegrityError once a few thousand sessions exist (the audit table was fixed for this,
     these weren't); the 8–128 character password policy (spec decision 3) isn't enforced
