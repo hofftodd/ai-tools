@@ -193,11 +193,11 @@ fi
 # ---- Model discovery ----------------------------------------------------------
 # Multi-shard GGUFs are named "<base>-00001-of-00005.gguf"; llama.cpp loads the
 # whole set from the first shard, so list only the first shard. Exclude any
-# projector file (*mmproj*.gguf) or a draft head (mtp-*.gguf, dflash-*.gguf) — those are
+# projector file (*mmproj*.gguf) or a draft head (mtp-*.gguf, dflash-*.gguf, dspark-*.gguf) — those are
 # companions to a model, not models. A model whose own MTP weights are baked in
 # is suffixed instead ("...-Q6_K-MTP.gguf") and stays listed.
 mapfile -t MODELS < <(
-  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' ! -iname 'mtp-*.gguf' ! -iname 'dflash-*.gguf' \
+  find "$MODELS_ROOT" -type f -name '*.gguf' ! -iname '*mmproj*.gguf' ! -iname 'mtp-*.gguf' ! -iname 'dflash-*.gguf' ! -iname 'dspark-*.gguf' \
     | awk '!/-[0-9]+-of-[0-9]+\.gguf$/ || /-0*1-of-[0-9]+\.gguf$/' \
     | sort
 )
@@ -239,15 +239,17 @@ mmproj_for() {
 mtp_for() {
   local dir cand
   dir="$(dirname "$1")"
-  cand="$(find "$dir" -maxdepth 2 \( -iname 'mtp-*.gguf' -o -iname 'dflash-*.gguf' \) | sort | head -1)"
+  cand="$(find "$dir" -maxdepth 2 \( -iname 'mtp-*.gguf' -o -iname 'dflash-*.gguf' -o -iname 'dspark-*.gguf' \) | sort | head -1)"
   echo "$cand"
 }
 
 # Correct --spec-type for a draft head found by mtp_for. Unsloth's MTP heads use
-# draft-mtp; Muse Glimmer's DFlash head needs draft-dflash.
+# draft-mtp; Muse Glimmer's DFlash head needs draft-dflash. Inkling 2's DSpark head
+# (Unsloth's llama.cpp fork) needs draft-dspark.
 spec_type_for_draft() {
   case "$(basename "$1" | tr '[:upper:]' '[:lower:]')" in
     dflash-*) echo "draft-dflash" ;;
+    dspark-*) echo "draft-dspark" ;;
     *)        echo "draft-mtp" ;;
   esac
 }
