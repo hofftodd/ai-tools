@@ -91,7 +91,8 @@ backend, so only one holds `:8080`, and restarts the backend.
   unloads it, so nothing gets evicted into system RAM), and a `hooks.on_startup.preload` for them. Per-model extras: models
   with MTP weights get `--spec-type draft-mtp` (self-speculative decode) — baked
   into the GGUF for Ornith, or as a sibling `mtp-*.gguf` head passed with
-  `--model-draft` for Qwen3.8; vision models get `--mmproj`; models needing a
+  `--model-draft` for Qwen3.8; a sibling `dflash-*.gguf` or `dspark-*.gguf` head gets
+  `--spec-type draft-dflash` or `draft-dspark` (Inkling 2, on Unsloth's llama.cpp fork); vision models get `--mmproj`; models needing a
   forked llama.cpp (e.g. Bonsai ternary) are emitted `unlisted: true` so they're
   hidden from clients until buildable.
   Per-model `--device` and `--ctx-size` come from
@@ -109,8 +110,8 @@ backend, so only one holds `:8080`, and restarts the backend.
 
 Multi-quant families are disambiguated by filename (e.g.
 `gemma-4-26b-a4b-it-ud-q4_k_m`); single-file families keep the short dir alias
-(`ornith-35b`). Projector files (`*mmproj*.gguf`), MTP draft heads
-(`mtp-*.gguf`), and non-first shards are never listed as models.
+(`ornith-35b`). Projector files (`*mmproj*.gguf`), draft heads
+(`mtp-*.gguf`, `dflash-*.gguf`, `dspark-*.gguf`), and non-first shards are never listed as models.
 
 ## Per-model overrides (`~/.config/llama-config/models.conf`)
 
@@ -136,6 +137,13 @@ qwen3.8-27b                          Vulkan1   98304
 
   ```
   inkling-2-mini  -  -  --server-bin ~/src/llama.cpp-inkling2/build/bin/llama-server
+  ```
+
+  The device field is checked against the default build's devices, so for a build with another
+  backend (ROCm, say) set it to `auto` and pass `--device` among the flags:
+
+  ```
+  inkling-2-mini  auto  262144  --server-bin ~/src/llama.cpp-rocm/llama-server --device ROCm0
   ```
 
 Use `-` to keep the default for either field — for `ctx` that means accepting the computed fit.
