@@ -307,6 +307,18 @@ for v in "${VARIANTS[@]}"; do
   OV_EXTRA[$v]="${OV_EXTRA[$base]:-}${OV_EXTRA[$base]:+ }${OV_EXTRA[$v]:-}"
 done
 
+# "--server-bin <path>" in a models.conf line runs that model on another llama-server build (a
+# newer one for an architecture the default build can't load). It's taken out of the flags.
+declare -A OV_BIN=()
+for a in "${!OV_EXTRA[@]}"; do
+  if [[ " ${OV_EXTRA[$a]} " =~ ^(.*)\ --server-bin\ ([^ ]+)\ (.*)$ ]]; then
+    sb_bin="${BASH_REMATCH[2]/#\~/$HOME}"
+    [[ -x "$sb_bin" ]] || die "$a: --server-bin $sb_bin is not an executable"
+    OV_BIN[$a]="$sb_bin"
+    sb_rest="${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"; sb_rest="${sb_rest#"${sb_rest%%[! ]*}"}"; OV_EXTRA[$a]="${sb_rest%"${sb_rest##*[! ]}"}"
+  fi
+done
+
 # ---- Resolve the resident set ------------------------------------------------
 # Priority: CLI args > existing config.yaml resident group > empty.
 # "none" clears the set: without it there is no way to unpin, since a bare run
@@ -418,7 +430,7 @@ server_macro="$LLAMA_SERVER --host 127.0.0.1 --port \${PORT} --n-gpu-layers $DEF
       flags+=" $extra"
     fi
     [[ -n "${OV_EXTRA[$a]:-}" ]] && flags+=" ${OV_EXTRA[$a]}"
-    cmd="\${server} --model $m --ctx-size $ctx $flags"
+    cmd="${OV_BIN[$a]:-\${server}} --model $m --ctx-size $ctx $flags"
     FLAGS_FOR[$a]="$flags"; MODEL_FOR[$a]="$m"; NOTE_FOR[$a]="$fit_note"; FITDEV_FOR[$a]="$fit_dev"
     ttl="$DEFAULT_TTL"; is_resident "$a" && ttl=0
     echo "  $a:"
@@ -521,6 +533,7 @@ if [[ "$LLAMA_BACKEND" == ai-swap ]]; then
       echo "  $a:"
       [[ -n "${NOTE_FOR[$a]:-}" ]] && echo "    # ${NOTE_FOR[$a]}"
       echo "    engine: llamacpp"
+      [[ -n "${OV_BIN[$a]:-}" ]] && echo "    bin: ${OV_BIN[$a]}"
       echo "    model: ${MODEL_FOR[$a]}"
       echo "    ctx: ${CTX_FOR[$a]}"
       echo "    memory_gb: $mem"

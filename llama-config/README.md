@@ -122,6 +122,13 @@ qwen3.8-27b                          Vulkan1   98304
 - **ctx** — overrides `LLAMA_CTX` for this model, and propagates to the
   `contextWindow` / `limit.context` the generated client configs advertise.
 - Anything after the third field is appended to that model's command verbatim.
+- `--server-bin <path>` among those flags runs the model on a different `llama-server` build
+  instead of `LLAMA_SERVER_BIN`, for an architecture the default build can't load. It becomes the
+  model's `bin:` in the ai-swap config (or its `cmd` in the llama-swap one), not a flag:
+
+  ```
+  inkling-2-mini  -  -  --server-bin ~/src/llama.cpp-inkling2/build/bin/llama-server
+  ```
 
 Use `-` to keep the default for either field — for `ctx` that means accepting the computed fit.
 
