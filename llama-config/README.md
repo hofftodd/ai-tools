@@ -49,8 +49,9 @@ rewrites the client configs (backing up the old ones to `*.bak`), writes the
 `claude-local` wrapper, restarts the `llama-swap` systemd user service, and
 health-checks `http://127.0.0.1:8080/v1/models`.
 
-The resident set defaults to CLI args; with no args it reads the existing
-`groups.resident.members` from `config.yaml` (needs `yq`), else empty.
+The resident set defaults to CLI args; with no args it reads ai-swap's
+`state.yaml` (the set chosen in ai-swap's UI or API), else the existing
+resident list from `config.yaml` (needs `yq`), else empty.
 
 ## ai-swap backend
 
@@ -65,7 +66,14 @@ llama-swap file:
   overrides the budget.
 - The resident set becomes `node.resident`: preloaded, never idle-unloaded,
   evicted when another model needs the card, and reloaded once it is free again.
-  With no CLI args it is read back from that file.
+  With no CLI args it is read back from ai-swap's `state.yaml` if the set was
+  changed in ai-swap's UI or API (models no longer under `~/models` are
+  dropped), else from that file. Residents named on the command line win: the
+  resident override in `state.yaml` is removed so ai-swap uses the new file.
+- ai-swap's default model (`default_model` in `state.yaml`, else
+  `node.default_model`, which is carried over) becomes the default model in the
+  client configs (opencode, pi, Claude Code) when it is one of this machine's
+  models; otherwise the first resident is, as before.
 - Any `peers:` already in the file are kept, so other machines (e.g. the Macs)
   survive a regenerate.
 - The new file is checked with `ai-swap -check` first; if it fails, the old file

@@ -12,7 +12,7 @@
 # and come back once it is free); by default that's the models you name on the
 # command line.
 #
-#   llama-config                       # keep the current resident set (from config.yaml)
+#   llama-config                       # keep the current resident set (ai-swap's state.yaml, else config.yaml)
 #   llama-config ornith-35b gpt-oss-20b   # pin these two resident, regenerate everything
 #   llama-config none                  # pin nothing, so the eGPU can idle down
 #
@@ -24,6 +24,9 @@ set -euo pipefail
 MODELS_ROOT="${LLAMA_MODELS_ROOT:-$HOME/models}"
 SWAP_CONFIG="${LLAMA_SWAP_CONFIG:-$HOME/.config/llama-swap/config.yaml}"
 AISWAP_CONFIG="${AISWAP_CONFIG:-$HOME/.config/ai-swap/config.yaml}"
+# ai-swap keeps settings changed from its UI/API (resident models, default model)
+# here, on top of config.yaml; it survives our regenerating config.yaml.
+AISWAP_STATE="$(dirname "$AISWAP_CONFIG")/state.yaml"
 # Which server to configure: ai-swap if its user service is enabled, else llama-swap.
 if [[ -z "${LLAMA_BACKEND:-}" ]]; then
   if systemctl --user is-enabled ai-swap.service >/dev/null 2>&1; then LLAMA_BACKEND=ai-swap; else LLAMA_BACKEND=llama-swap; fi
@@ -320,7 +323,8 @@ for a in "${!OV_EXTRA[@]}"; do
 done
 
 # ---- Resolve the resident set ------------------------------------------------
-# Priority: CLI args > existing config.yaml resident group > empty.
+# Priority: CLI args > ai-swap's state.yaml (set from its UI/API) > existing
+# config.yaml resident group > empty.
 # "none" clears the set: without it there is no way to unpin, since a bare run
 # re-reads the group it wrote last time. Nothing pinned means the R9700 has no
 # process holding it open once TTLs expire, so it can runtime-suspend.
@@ -329,12 +333,45 @@ if [[ $# -eq 1 && ( "$1" == none || "$1" == - ) ]]; then
   RESIDENT=()
 elif [[ $# -gt 0 ]]; then
   RESIDENT=("$@")
+elif [[ "$LLAMA_BACKEND" == ai-swap && -f "$AISWAP_STATE" ]] && have yq &&
+     [[ "$(yq -r '.resident | type' "$AISWAP_STATE" 2>/dev/null)" == '!!seq' ]]; then
+  # Models since removed from ~/models are dropped (ai-swap would skip them too).
+  while IFS= read -r r; do
+    [[ -z "$r" ]] && continue
+    found=0; for a in "${ALIASES[@]}"; do [[ "$a" == "$r" ]] && found=1; done
+    if [[ $found -eq 1 ]]; then RESIDENT+=("$r"); else echo "  note: dropping resident $r from $AISWAP_STATE (no such model now)" >&2; fi
+  done < <(yq -r '.resident[]?' "$AISWAP_STATE" 2>/dev/null)
 elif [[ "$LLAMA_BACKEND" == ai-swap && -f "$AISWAP_CONFIG" ]] && have yq; then
   mapfile -t RESIDENT < <(yq -r '.node.resident[]?' "$AISWAP_CONFIG" 2>/dev/null)
 elif [[ -f "$SWAP_CONFIG" ]] && have yq; then
   mapfile -t RESIDENT < <(yq -r '.groups.resident.members[]?' "$SWAP_CONFIG" 2>/dev/null)
 fi
 is_resident() { local a; for a in "${RESIDENT[@]:-}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
+# Residents named on the command line replace any set from ai-swap's UI/API:
+# drop state.yaml's override so ai-swap uses the config.yaml written below.
+if [[ $# -gt 0 && "$LLAMA_BACKEND" == ai-swap && -f "$AISWAP_STATE" ]] && have yq &&
+   [[ "$(yq -r 'has("resident")' "$AISWAP_STATE" 2>/dev/null)" == true ]]; then
+  yq -i 'del(.resident)' "$AISWAP_STATE"
+  echo "cleared the resident override in $AISWAP_STATE (command line wins)"
+fi
+
+# The default model (serves requests that name none): ai-swap's state.yaml, else
+# node.default_model from the current config.yaml; kept if the model still exists.
+DEFAULT_MODEL=""
+if [[ "$LLAMA_BACKEND" == ai-swap ]] && have yq; then
+  for f in "$AISWAP_STATE" "$AISWAP_CONFIG"; do
+    [[ -f "$f" ]] || continue
+    q='.default_model'; [[ "$f" == "$AISWAP_CONFIG" ]] && q='.node.default_model'
+    if [[ "$(yq -r "($q | type)" "$f" 2>/dev/null)" == '!!str' ]]; then
+      DEFAULT_MODEL="$(yq -r "$q" "$f")"
+      break
+    fi
+  done
+  if [[ -n "$DEFAULT_MODEL" && "$DEFAULT_MODEL" != *@* ]]; then
+    found=0; for a in "${ALIASES[@]}"; do [[ "$a" == "$DEFAULT_MODEL" ]] && found=1; done
+    [[ $found -eq 1 ]] || { echo "  note: default model $DEFAULT_MODEL no longer exists; ignoring it" >&2; DEFAULT_MODEL=""; }
+  fi
+fi
 
 # Validate resident aliases exist.
 for r in "${RESIDENT[@]}"; do
@@ -345,6 +382,7 @@ done
 echo "Backend: $LLAMA_BACKEND"
 echo "Discovered ${#MODELS[@]} models under $MODELS_ROOT"
 echo "Resident (pinned hot): ${RESIDENT[*]:-<none>}"
+[[ -n "$DEFAULT_MODEL" ]] && echo "Default model: $DEFAULT_MODEL"
 for d in "${!DEV_NAME[@]}"; do
   role=""
   [[ "$d" == "$DEV_DGPU" ]] && role="  <- 'egpu'"
@@ -499,6 +537,10 @@ if [[ "$LLAMA_BACKEND" == ai-swap ]]; then
     if [[ ${#RESIDENT[@]} -gt 0 ]]; then
       echo "  resident: $(printf '%s\n' "${RESIDENT[@]}" | jq -R . | jq -sc .)"
     fi
+    # Carried over from the previous file (ai-swap's state.yaml may override it).
+    if [[ -n "$DEFAULT_MODEL" ]] && ! needs_fork "$DEFAULT_MODEL" && [[ -f "$AISWAP_CONFIG" && "$(yq -r '.node.default_model // ""' "$AISWAP_CONFIG" 2>/dev/null)" == "$DEFAULT_MODEL" ]]; then
+      echo "  default_model: $DEFAULT_MODEL"
+    fi
     echo
     if [[ "$peers_json" == "[]" ]]; then
       echo "# peers:"
@@ -552,8 +594,11 @@ if [[ "$LLAMA_BACKEND" == ai-swap ]]; then
   echo "wrote $AISWAP_CONFIG${budget_gb:+ (budget ${budget_gb} GB)}"
 fi
 
-# Choose default + small models for clients (prefer resident; small = oss/nano/mini).
+# Choose default + small models for clients (ai-swap's default model, else
+# prefer resident; small = oss/nano/mini). A peer's model (model@node) has no
+# local client entry, so it doesn't count here.
 default_alias="${RESIDENT[0]:-${LISTED_ALIASES[0]:-${ALIASES[0]}}}"
+[[ -n "$DEFAULT_MODEL" && "$DEFAULT_MODEL" != *@* ]] && default_alias="$DEFAULT_MODEL"
 small_alias="$default_alias"
 for a in "${RESIDENT[@]:-}" "${LISTED_ALIASES[@]}"; do
   case "$a" in *oss*|*nano*|*mini*|*small*|*e2b*|*e4b*) small_alias="$a"; break ;; esac
