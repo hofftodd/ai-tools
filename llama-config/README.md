@@ -76,6 +76,9 @@ llama-swap file:
   models; otherwise the first resident is, as before.
 - Any `peers:` already in the file are kept, so other machines (e.g. the Macs)
   survive a regenerate.
+- So are hand-written models of any engine other than `llamacpp` (e.g. a
+  Radiance or strata server under `engine: generic`), which this script can't
+  generate: they're appended after the generated models, comments included.
 - The new file is checked with `ai-swap -check` first; if it fails, the old file
   is left in place. The previous file is kept as `config.yaml.bak`.
 - Models that need a forked llama.cpp are left out (ai-swap has no `unlisted`).
